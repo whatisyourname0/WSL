@@ -144,8 +144,8 @@ still overflow bounded queues and must surface as errors, not dropped audio.
 
 The worker session and source controller each own one overlapped reader and
 writer, and wait on their completion events alongside state/process events.
-Readers have no idle timeout; receipt of the first byte arms a bounded partial
-frame deadline. Writes have a bounded deadline, and pending IO is canceled and
+Readers have no idle timeout. The partial-frame deadline starts when `Advance`
+observes completion of the first header read and covers the rest of that frame. Writes have a bounded deadline, and pending IO is canceled and
 drained before closing a pipe or releasing its buffers. Control transitions get
 an opportunity between received frames, including under continuous PCM input.
 The worker preserves response order in a bounded queue and drains Closed/Fault
@@ -180,8 +180,9 @@ counts queue activity signals; these can coalesce and are not wake counts.
 Forced process exit does not guarantee a summary. No per-period ETW event is
 added by this instrumentation.
 
-The core retains a maximum-sized PCM scratch vector (1 MiB minus 12 bytes of
-transport overhead) per device. The worker retains its validated IPC wire buffer
+The core allocates its bounded PCM scratch vector (1 MiB minus 12 bytes of
+transport overhead) on the first valid PCM configuration, before capture can
+start, and retains it across resets and later configurations. The worker retains its validated IPC wire buffer
 and one overlapped event per writer. Both buffers can retain previous PCM in
 private process memory until overwritten or destroyed; diagnostics never export
 them. Pipe cancellation drains outstanding I/O before reuse. A failed write can
@@ -197,3 +198,25 @@ idle waits, and synthetic deadlines. Local byte-pipe tests cover partial frames,
 duplex progress, timeout, cancellation, and reuse. These checks do not exercise
 the complete authenticated process graph or physical endpoint loss. Validate
 those separately before claiming end-to-end performance gains.
+
+## RX doorbell shutdown ordering
+
+Normal VM shutdown requests RX doorbell preparation before closing the mini_init
+channel. The private HDV child unregisters the optional doorbell from its pump
+thread, outside callbacks, and acknowledges the result. Stop preparation drains
+in-flight registration and prevents new registration; MMIO notification fallback
+remains available during guest shutdown. Post-exit retirement does not retry
+unregister against a stopped device.
+
+If preparation times out or its wait fails, the parent clears the pending request
+and closes only its owned kill-on-close child job. The request wait and emergency
+exit wait are each bounded to two seconds, though OS scheduling can extend elapsed
+time. Emergency exit is not reported as successful unregister. Uncertain event
+ownership remains pinned until the private process exits, and shared or unknown
+HDV host ownership never permits whole-host teardown.
+
+The ordering guarantee applies to orderly stop. An independent guest exit can
+race a preparation already in flight; unregister may then return an invalid-state
+error. Failure retains the event/callback root and is negatively acknowledged,
+rather than being treated as successful unregister. No cross-process state check
+can make that independent exit atomic with an HDV API call.
