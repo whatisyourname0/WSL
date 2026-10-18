@@ -21,6 +21,7 @@
 #include "AudioWorkerTrace.hpp"
 #include "WasapiCaptureTiming.hpp"
 #include "WasapiInitialPacketPolicy.hpp"
+#include "WasapiOpenPolicy.hpp"
 
 namespace wsl::virtio_sound::audio_worker {
 namespace {
@@ -64,6 +65,64 @@ namespace {
                 << static_cast<unsigned long>(result) << L").";
         detail::TraceAudioWorker(operation, static_cast<std::uint64_t>(code), static_cast<std::uint32_t>(result));
         return {code, static_cast<long>(result), message.str()};
+    }
+
+    class WasapiCaptureOpenAdapter final
+    {
+    public:
+        WasapiCaptureOpenAdapter(IMMDevice* device, wil::com_ptr<IAudioClient>& audioClient, const WAVEFORMATEX* format) noexcept :
+            m_device(device),
+            m_audioClient(audioClient),
+            m_format(format)
+        {
+        }
+
+        HRESULT Initialize(REFERENCE_TIME bufferDuration, REFERENCE_TIME periodicity) noexcept
+        {
+            return m_audioClient->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+                bufferDuration,
+                periodicity,
+                m_format,
+                nullptr);
+        }
+
+        HRESULT ActivateFresh() noexcept
+        {
+            m_audioClient.reset();
+            return m_device->Activate(
+                __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(m_audioClient.put()));
+        }
+
+        HRESULT GetBufferSize(UINT32* bufferFrames) noexcept
+        {
+            return m_audioClient->GetBufferSize(bufferFrames);
+        }
+
+    private:
+        IMMDevice* m_device;
+        wil::com_ptr<IAudioClient>& m_audioClient;
+        const WAVEFORMATEX* m_format;
+    };
+
+    const wchar_t* WasapiOpenFailureOperation(WasapiOpenFailure failure) noexcept
+    {
+        switch (failure)
+        {
+        case WasapiOpenFailure::FreshClientActivation:
+            return L"IMMDevice::Activate(IAudioClient) after buffer-argument rejection";
+        case WasapiOpenFailure::DefaultBufferInitialize:
+            return L"IAudioClient::Initialize(0, 0)";
+        case WasapiOpenFailure::GetBufferSize:
+            return L"IAudioClient::GetBufferSize";
+        case WasapiOpenFailure::ZeroBufferCapacity:
+            return L"IAudioClient::GetBufferSize returned zero capacity";
+        case WasapiOpenFailure::Initialize:
+        case WasapiOpenFailure::None:
+        default:
+            return L"IAudioClient::Initialize";
+        }
     }
 
     bool SetWasapiErrorIfFailed(HRESULT result, CaptureErrorCode code, const wchar_t* operation, CaptureError& error)
@@ -200,26 +259,23 @@ namespace {
             // history to tolerate a short scheduling stall. Capacity is not a
             // batching interval: neither the event period nor guest pacing changes.
             const REFERENCE_TIME bufferDuration = static_cast<REFERENCE_TIME>(c_captureBufferReserve.count()) * 10000;
-            result = m_audioClient->Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
-                bufferDuration,
-                0,
-                &requiredFormat.Format,
-                nullptr);
-            if (SetWasapiErrorIfFailed(result, CaptureErrorCode::EndpointOpenFailed, L"IAudioClient::Initialize", error))
+            WasapiCaptureOpenAdapter captureOpenAdapter{m_device.get(), m_audioClient, &requiredFormat.Format};
+            const WasapiOpenResult openResult = InitializeSharedEventCapture(captureOpenAdapter, bufferDuration);
+            m_usedDefaultBufferFallback = openResult.m_usedDefaultBufferFallback;
+            if (!openResult.Succeeded())
             {
+                (void)SetWasapiErrorIfFailed(
+                    openResult.m_hresult, CaptureErrorCode::EndpointOpenFailed,
+                    WasapiOpenFailureOperation(openResult.m_failure), error);
                 return false;
             }
 
-            // Retain the endpoint's actual engine buffer size as diagnostic metadata.
-            // This must never change open success or the capture policy.
-            UINT32 endpointBufferFrames = 0;
-            if (SUCCEEDED(m_audioClient->GetBufferSize(&endpointBufferFrames)))
-            {
-                m_endpointBufferFrames = endpointBufferFrames;
-                m_endpointBufferFramesValid = true;
-            }
+            // The actual capacity is required by the notification watchdog, so
+            // an unknown or zero capacity cannot be treated as diagnostic-only.
+            m_endpointBufferFrames = openResult.m_endpointBufferFrames;
+            m_endpointBufferFramesValid = true;
+            detail::TraceAudioWorker(
+                L"CaptureBufferCapacityFrames", m_endpointBufferFrames, m_usedDefaultBufferFallback ? 1U : 0U);
 
             m_captureEvent.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
             if (!m_captureEvent)
@@ -646,6 +702,9 @@ namespace {
             detail::TraceAudioWorker(L"CaptureDiagnosticsEndpointBufferFrames",
                 m_endpointBufferFramesValid ? m_endpointBufferFrames : 0U,
                 m_endpointBufferFramesValid ? 1U : 0U);
+            detail::TraceAudioWorker(
+                L"CaptureDiagnosticsDefaultBufferFallback", m_usedDefaultBufferFallback ? 1U : 0U,
+                m_endpointBufferFramesValid ? m_endpointBufferFrames : 0U);
         }
 
         wil::com_ptr<IMMDeviceEnumerator> m_enumerator;
@@ -661,6 +720,7 @@ namespace {
         bool m_streamStarted{};
         bool m_openAttempted{};
         bool m_endpointBufferFramesValid{};
+        bool m_usedDefaultBufferFallback{};
         bool m_captureDiagnosticsReported{};
         bool m_haveLastReadStart{};
         bool m_haveLastPacketCompletion{};
