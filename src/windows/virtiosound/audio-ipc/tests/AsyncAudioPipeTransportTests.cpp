@@ -38,6 +38,8 @@ using wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter;
 using wsl::virtio_sound::audio_ipc::windows::PipeMessageReader;
 using wsl::virtio_sound::audio_ipc::windows::PipeResult;
 
+constexpr DWORD c_testPipeInputBufferBytes = 4096U;
+
 int failures = 0;
 
 bool Check(bool condition, const char* description)
@@ -147,7 +149,7 @@ bool CreatePipePair(OwnedHandle& server, OwnedHandle& client, DWORD serverOutput
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         1U,
         serverOutputBufferBytes,
-        4096U,
+        c_testPipeInputBufferBytes,
         0U,
         nullptr));
     if (!server)
@@ -206,14 +208,14 @@ bool CreatePipePair(OwnedHandle& server, OwnedHandle& client, DWORD serverOutput
     return true;
 }
 
-bool WriteAll(HANDLE pipe, const std::vector<std::uint8_t>& bytes)
+bool WriteAll(HANDLE pipe, const std::uint8_t* data, std::size_t byteCount)
 {
     std::size_t offset = 0U;
-    while (offset < bytes.size())
+    while (offset < byteCount)
     {
         DWORD transferred = 0U;
-        const DWORD requested = static_cast<DWORD>((std::min)(bytes.size() - offset, static_cast<std::size_t>(MAXDWORD)));
-        if (WriteFile(pipe, bytes.data() + offset, requested, &transferred, nullptr) == FALSE || transferred == 0U)
+        const DWORD requested = static_cast<DWORD>((std::min)(byteCount - offset, static_cast<std::size_t>(MAXDWORD)));
+        if (WriteFile(pipe, data + offset, requested, &transferred, nullptr) == FALSE || transferred == 0U)
         {
             std::cerr << "WriteFile failed: " << GetLastError() << '\n';
             return false;
@@ -221,6 +223,11 @@ bool WriteAll(HANDLE pipe, const std::vector<std::uint8_t>& bytes)
         offset += transferred;
     }
     return true;
+}
+
+bool WriteAll(HANDLE pipe, const std::vector<std::uint8_t>& bytes)
+{
+    return WriteAll(pipe, bytes.data(), bytes.size());
 }
 
 bool ReadAll(HANDLE pipe, std::size_t byteCount, std::vector<std::uint8_t>& bytes)
@@ -337,7 +344,7 @@ void TestIdleReaderPartialTimeoutAndRecovery()
     {
         return;
     }
-    Check(reader.WaitTimeoutMilliseconds() == INFINITE, "idle first-byte probe has no frame deadline");
+    Check(reader.WaitTimeoutMilliseconds() == INFINITE, "idle initial header read has no frame deadline");
     Sleep(160U);
     Message out = MakeMessage(MessageType::Hello, 100U);
     Check(reader.Advance(out) == PipeResult::Pending, "idle reader stays pending beyond the partial-frame timeout");
@@ -397,69 +404,106 @@ void TestIdleReaderPartialTimeoutAndRecovery()
     Check(out.m_header.m_sequence == input.m_header.m_sequence && out.m_payload == input.m_payload, "recovered frame preserves exact payload bytes");
 }
 
-void TestInvalidHeaderBeforePayloadAndOutPreservation()
+void TestInvalidHeaderDoesNotConsumeSuffix(const std::vector<std::uint8_t>& invalidHeader, const std::vector<std::uint8_t>& trailingBytes, const char* caseName)
 {
     OwnedHandle server;
     OwnedHandle client;
-    Check(CreatePipePair(server, client), "pipe pair opens for invalid header test");
-    if (!server || !client)
+    const std::string pipeDescription = std::string("pipe pair opens for ") + caseName;
+    if (!Check(CreatePipePair(server, client), pipeDescription.c_str()))
     {
         return;
     }
-
-    Message oversized = MakeMessage(MessageType::Pcm, 12U, std::vector<std::uint8_t>(4U, 0x11U));
-    std::vector<std::uint8_t> invalidWire;
-    if (!Check(Encode(oversized, invalidWire), "valid template frame encodes"))
+    const std::string headerSizeDescription = std::string(caseName) + " provides exactly one full header";
+    if (!Check(invalidHeader.size() == c_headerBytes, headerSizeDescription.c_str()))
     {
         return;
     }
-    invalidWire[8U] = static_cast<std::uint8_t>((c_maxPayloadBytes + 1U) & 0xFFU);
-    invalidWire[9U] = static_cast<std::uint8_t>(((c_maxPayloadBytes + 1U) >> 8U) & 0xFFU);
-    invalidWire[10U] = static_cast<std::uint8_t>(((c_maxPayloadBytes + 1U) >> 16U) & 0xFFU);
-    invalidWire[11U] = static_cast<std::uint8_t>(((c_maxPayloadBytes + 1U) >> 24U) & 0xFFU);
-    invalidWire.resize(c_headerBytes);
 
     // Put additional bytes immediately behind the malformed header. The reader
     // must reject the header without consuming any of those bytes.
-    const Message nextFrame = MakeMessage(MessageType::Hello, 13U);
-    std::vector<std::uint8_t> nextFrameWire;
-    if (!Check(Encode(nextFrame, nextFrameWire), "following frame encodes for malformed-header boundary test"))
-    {
-        return;
-    }
-    std::vector<std::uint8_t> trailingBytes{0xA1U, 0xB2U, 0xC3U, 0xD4U};
-    trailingBytes.insert(trailingBytes.end(), nextFrameWire.begin(), nextFrameWire.end());
-    std::vector<std::uint8_t> invalidStream = invalidWire;
+    std::vector<std::uint8_t> invalidStream = invalidHeader;
     invalidStream.insert(invalidStream.end(), trailingBytes.begin(), trailingBytes.end());
 
     PipeMessageReader reader;
     Message out = MakePcmMessage(99U, 32U, 0x19U);
     const Message unchanged = out;
-    if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader starts before invalid header arrives") ||
-        !Check(WriteAll(client.Get(), invalidStream), "oversized header and following bytes reach reader together"))
+    const std::string beginDescription = std::string("reader starts before ") + caseName + " arrives";
+    const std::string writeDescription = std::string(caseName) + " and following bytes reach reader together";
+    const std::string invalidDescription = std::string(caseName) + " is rejected from the complete header";
+    if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, beginDescription.c_str()) ||
+        !Check(WriteAll(client.Get(), invalidStream), writeDescription.c_str()))
     {
         reader.CancelAndDrain();
         return;
     }
-    if (!Check(AwaitReader(reader, out, 1000U) == PipeResult::InvalidMessage, "invalid payload length is rejected from the header alone"))
+    if (!Check(AwaitReader(reader, out, 1000U) == PipeResult::InvalidMessage, invalidDescription.c_str()))
     {
         reader.CancelAndDrain();
         return;
     }
-    Check(MessageMatches(out, unchanged), "invalid header leaves the caller message unchanged");
+    const std::string outputDescription = std::string(caseName) + " leaves the caller message unchanged";
+    Check(MessageMatches(out, unchanged), outputDescription.c_str());
 
     std::vector<std::uint8_t> peekedBytes(trailingBytes.size());
     DWORD bytesRead = 0U;
     DWORD bytesAvailable = 0U;
+    const std::string peekDescription = std::string(caseName) + " leaves following bytes available in the pipe";
     if (!Check(
             PeekNamedPipe(server.Get(), peekedBytes.data(), static_cast<DWORD>(peekedBytes.size()), &bytesRead, &bytesAvailable, nullptr) != FALSE,
-            "bytes after the malformed header remain available in the pipe"))
+            peekDescription.c_str()))
     {
         return;
     }
+    const std::string suffixDescription = std::string(caseName) + " consumes neither the suffix nor the next frame";
     Check(
         bytesRead == trailingBytes.size() && bytesAvailable == trailingBytes.size() && peekedBytes == trailingBytes,
-        "malformed-header rejection consumes neither trailing bytes nor the next frame");
+        suffixDescription.c_str());
+}
+
+void TestInvalidHeaderBeforePayloadAndOutPreservation()
+{
+    const Message nextFrame = MakeMessage(MessageType::Hello, 13U);
+    std::vector<std::uint8_t> nextFrameWire;
+    if (!Check(Encode(nextFrame, nextFrameWire), "following frame encodes for malformed-header boundary tests"))
+    {
+        return;
+    }
+    std::vector<std::uint8_t> trailingBytes{0xA1U, 0xB2U, 0xC3U, 0xD4U};
+    trailingBytes.insert(trailingBytes.end(), nextFrameWire.begin(), nextFrameWire.end());
+
+    Message oversized = MakeMessage(MessageType::Pcm, 12U, std::vector<std::uint8_t>(4U, 0x11U));
+    std::vector<std::uint8_t> oversizedHeader;
+    if (!Check(Encode(oversized, oversizedHeader), "valid template frame encodes for oversized-header test"))
+    {
+        return;
+    }
+    const std::uint32_t oversizedPayloadBytes = static_cast<std::uint32_t>(c_maxPayloadBytes + 1U);
+    oversizedHeader[8U] = static_cast<std::uint8_t>(oversizedPayloadBytes & 0xFFU);
+    oversizedHeader[9U] = static_cast<std::uint8_t>((oversizedPayloadBytes >> 8U) & 0xFFU);
+    oversizedHeader[10U] = static_cast<std::uint8_t>((oversizedPayloadBytes >> 16U) & 0xFFU);
+    oversizedHeader[11U] = static_cast<std::uint8_t>((oversizedPayloadBytes >> 24U) & 0xFFU);
+    oversizedHeader.resize(c_headerBytes);
+    TestInvalidHeaderDoesNotConsumeSuffix(oversizedHeader, trailingBytes, "oversized payload header");
+
+    Message validHello = MakeMessage(MessageType::Hello, 14U);
+    std::vector<std::uint8_t> invalidMagicHeader;
+    if (!Check(Encode(validHello, invalidMagicHeader), "valid Hello frame encodes for invalid-magic test"))
+    {
+        return;
+    }
+    invalidMagicHeader[0U] ^= 0x01U;
+    invalidMagicHeader.resize(c_headerBytes);
+    TestInvalidHeaderDoesNotConsumeSuffix(invalidMagicHeader, trailingBytes, "invalid magic header");
+
+    Message validPcm = MakePcmMessage(15U, 4U, 0x5AU);
+    std::vector<std::uint8_t> zeroLengthPcmHeader;
+    if (!Check(Encode(validPcm, zeroLengthPcmHeader), "valid PCM frame encodes for zero-length test"))
+    {
+        return;
+    }
+    std::fill(zeroLengthPcmHeader.begin() + 8, zeroLengthPcmHeader.begin() + 12, std::uint8_t{0U});
+    zeroLengthPcmHeader.resize(c_headerBytes);
+    TestInvalidHeaderDoesNotConsumeSuffix(zeroLengthPcmHeader, trailingBytes, "zero-length PCM header");
 }
 
 void TestPrequeuedPcmFramesRespectExactBoundary()
@@ -474,17 +518,25 @@ void TestPrequeuedPcmFramesRespectExactBoundary()
 
     const Message first = MakePcmMessage(14U, 192U, 0x2BU);
     const Message second = MakePcmMessage(15U, 68U, 0x91U);
+    const Message zeroPayload = MakeMessage(MessageType::Hello, 16U);
+    const Message afterZeroPayload = MakePcmMessage(17U, 36U, 0xB3U);
     std::vector<std::uint8_t> firstWire;
     std::vector<std::uint8_t> secondWire;
+    std::vector<std::uint8_t> zeroPayloadWire;
+    std::vector<std::uint8_t> afterZeroPayloadWire;
     if (!Check(Encode(first, firstWire), "first prequeued PCM frame encodes") ||
-        !Check(Encode(second, secondWire), "second prequeued PCM frame encodes"))
+        !Check(Encode(second, secondWire), "second prequeued PCM frame encodes") ||
+        !Check(Encode(zeroPayload, zeroPayloadWire), "prequeued zero-payload Hello encodes") ||
+        !Check(Encode(afterZeroPayload, afterZeroPayloadWire), "PCM frame after zero-payload Hello encodes"))
     {
         return;
     }
 
     std::vector<std::uint8_t> prequeued = firstWire;
     prequeued.insert(prequeued.end(), secondWire.begin(), secondWire.end());
-    if (!Check(WriteAll(client.Get(), prequeued), "two complete PCM frames are prequeued back-to-back"))
+    prequeued.insert(prequeued.end(), zeroPayloadWire.begin(), zeroPayloadWire.end());
+    prequeued.insert(prequeued.end(), afterZeroPayloadWire.begin(), afterZeroPayloadWire.end());
+    if (!Check(WriteAll(client.Get(), prequeued), "PCM+PCM and Hello+PCM pairs are prequeued at exact boundaries"))
     {
         return;
     }
@@ -506,6 +558,22 @@ void TestPrequeuedPcmFramesRespectExactBoundary()
         return;
     }
     Check(MessageMatches(out, second), "adjacent frame remains intact after the preceding PCM read");
+
+    if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader begins at the zero-payload Hello boundary") ||
+        !Check(AwaitReader(reader, out, 1000U) == PipeResult::Success, "reader completes the prequeued zero-payload Hello"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+    Check(MessageMatches(out, zeroPayload), "zero-payload Hello ends exactly at its 32-byte header boundary");
+
+    if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader begins at the PCM frame following Hello") ||
+        !Check(AwaitReader(reader, out, 1000U) == PipeResult::Success, "reader completes PCM immediately following Hello"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+    Check(MessageMatches(out, afterZeroPayload), "PCM following zero-payload Hello remains intact");
 }
 
 void TestFragmentedHeadersDeliverForSeveralSplitPoints()
@@ -560,6 +628,141 @@ void TestFragmentedHeadersDeliverForSeveralSplitPoints()
             return;
         }
         Check(MessageMatches(out, expected), "fragmented header and payload preserve the full decoded message");
+    }
+}
+
+void TestReaderFragmentedMixedSizeReuseAcross64Messages()
+{
+    constexpr std::size_t c_maxFragmentBytes = 1024U;
+    static_assert(c_maxFragmentBytes < c_testPipeInputBufferBytes, "fragment writes must stay below the pipe input buffer");
+    constexpr std::size_t c_messageCount = 64U;
+    constexpr std::array<std::size_t, 6U> c_mixedPayloadSizes{4U, 64U, 1024U, 4096U, 128U, 2048U};
+
+    OwnedHandle server;
+    OwnedHandle client;
+    Check(CreatePipePair(server, client), "pipe pair opens for fragmented mixed-size reader reuse test");
+    if (!server || !client)
+    {
+        return;
+    }
+
+    PipeMessageReader reader;
+    Message received{};
+    HANDLE stableEvent = nullptr;
+    const std::uint8_t* firstPayloadBuffer = nullptr;
+    const std::uint8_t* secondPayloadBuffer = nullptr;
+    std::uint32_t randomState = 0x6D2B79F5U;
+    const auto nextRandom = [&randomState]() {
+        randomState ^= randomState << 13U;
+        randomState ^= randomState >> 17U;
+        randomState ^= randomState << 5U;
+        return randomState;
+    };
+
+    for (std::size_t index = 0U; index < c_messageCount; ++index)
+    {
+        // The first two maximum-size frames warm both reusable payload buffers.
+        // Later messages vary their sizes while retaining the same two buffers.
+        const std::size_t payloadBytes = index < 2U ? c_maxPayloadBytes : c_mixedPayloadSizes[(index - 2U) % c_mixedPayloadSizes.size()];
+        const std::uint64_t sequence = 4000U + index;
+        const Message expected = MakePcmMessage(sequence, payloadBytes, static_cast<std::uint8_t>(0x31U + index));
+        std::vector<std::uint8_t> wire;
+        if (!Check(Encode(expected, wire), "mixed-size PCM frame encodes for fragmented reader reuse"))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+        if (!Check(reader.Begin(server.Get(), 5000U) == PipeResult::Pending, "reader begins the next fragmented reuse frame"))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+
+        if (stableEvent == nullptr)
+        {
+            stableEvent = reader.Event();
+        }
+        if (!Check(stableEvent != nullptr && reader.Event() == stableEvent, "reader reuses one operation event across frames"))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+
+        std::size_t offset = 0U;
+        while (offset < wire.size())
+        {
+            std::size_t fragmentBytes = 0U;
+            if (offset < c_headerBytes)
+            {
+                // Keep the header in several reproducible fragments on every
+                // frame; the fixed seed also varies the payload fragmentation.
+                fragmentBytes = (std::min)(static_cast<std::size_t>(1U + (nextRandom() % 11U)), c_headerBytes - offset);
+            }
+            else
+            {
+                fragmentBytes = (std::min)(static_cast<std::size_t>(1U + (nextRandom() % c_maxFragmentBytes)), wire.size() - offset);
+            }
+
+            if (!Check(
+                    WriteAll(client.Get(), wire.data() + offset, fragmentBytes), "fixed-seed frame fragment reaches the reader") ||
+                !Check(
+                    WaitForSingleObject(reader.Event(), 1000U) == WAIT_OBJECT_0, "each fragment completes within a finite wait"))
+            {
+                reader.CancelAndDrain();
+                return;
+            }
+
+            const bool finalFragment = offset + fragmentBytes == wire.size();
+            PipeResult result = reader.Advance(received);
+            offset += fragmentBytes;
+            if (finalFragment)
+            {
+                if (result == PipeResult::Pending)
+                {
+                    result = AwaitReader(reader, received, 1000U);
+                }
+                if (!Check(result == PipeResult::Success, "reader completes after the final fragment"))
+                {
+                    reader.CancelAndDrain();
+                    return;
+                }
+            }
+            else if (!Check(result == PipeResult::Pending, "reader remains pending between frame fragments"))
+            {
+                reader.CancelAndDrain();
+                return;
+            }
+        }
+
+        if (!Check(MessageMatches(received, expected), "fragmented mixed-size reuse preserves exact sequence and payload") ||
+            !Check(received.m_payload.capacity() <= c_maxPayloadBytes, "fragmented reuse keeps output payload capacity bounded"))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+
+        if (index == 0U)
+        {
+            firstPayloadBuffer = received.m_payload.data();
+        }
+        else if (index == 1U)
+        {
+            secondPayloadBuffer = received.m_payload.data();
+            if (!Check(
+                    firstPayloadBuffer != nullptr && secondPayloadBuffer != nullptr && firstPayloadBuffer != secondPayloadBuffer,
+                    "maximum-size warm-up allocates two distinct reusable payload buffers"))
+            {
+                reader.CancelAndDrain();
+                return;
+            }
+        }
+        else if (!Check(
+                     received.m_payload.data() == firstPayloadBuffer || received.m_payload.data() == secondPayloadBuffer,
+                     "long mixed-size reuse stays within the two warmed payload buffers"))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
     }
 }
 
@@ -1067,6 +1270,7 @@ int main()
     TestInvalidHeaderBeforePayloadAndOutPreservation();
     TestPrequeuedPcmFramesRespectExactBoundary();
     TestFragmentedHeadersDeliverForSeveralSplitPoints();
+    TestReaderFragmentedMixedSizeReuseAcross64Messages();
     TestMidHeaderDisconnectPreservesOutput();
     TestConcurrentReadWriteAndBufferReuse();
     TestReaderRecyclesPayloadBuffersAcrossFourMessages();
