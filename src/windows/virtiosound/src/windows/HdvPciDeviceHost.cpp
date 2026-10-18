@@ -1314,10 +1314,6 @@ std::unique_ptr<HdvPciDeviceHost> HdvPciDeviceHost::CreateBorrowed(
         state->FailClosedAfterRegistration();
         THROW_HR(E_UNEXPECTED);
     }
-    // Optional exact-match RX-kick notification. The callback remains
-    // installed for all other writes and is the fallback when either optional
-    // export or the owner's existing wake event is unavailable.
-    (void)state->RegisterRxDoorbell(api);
     try
     {
         // Copy the shared owner until allocation succeeds so the failure path
@@ -1510,6 +1506,15 @@ CaptureServiceResult HdvPciDeviceHost::ServiceCapture(std::uint64_t elapsedNanos
     }
     try
     {
+        // The exact RX callback proves that the guest has assigned and used
+        // this BAR address. Register from the host servicing thread, outside
+        // both the HDV callback and the device gate, while this started
+        // Operation pins BackendState against retirement.
+        if (m_state->m_rxDoorbell.State() == detail::RxDoorbellState::Unattempted &&
+            m_state->m_rxCallbackFastPathRequests.load(std::memory_order_relaxed) != 0)
+        {
+            (void)m_state->RegisterRxDoorbell(LoadApi());
+        }
         BackendState::ApertureBatch apertureBatch(*m_state);
 #if defined(WSL_VIRTIO_SOUND_ADAPTER_TESTING)
         NotifyAperturePumpTestHook(m_state.get());
