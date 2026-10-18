@@ -3,7 +3,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <utility>
 
 namespace wsl::virtio_sound::native::windows::detail {
 
@@ -27,7 +30,10 @@ enum class RxDoorbellState : std::uint8_t
     Registered,
     Unregistering,
     Unregistered,
-    UnregisterFailed
+    UnregisterFailed,
+    Prepared,
+    UnregisterSkippedAfterGuestStop,
+    Retired
 };
 
 class RxDoorbellLifecycle final
@@ -36,17 +42,23 @@ public:
     template <typename Register>
     bool TryRegister(bool apiPairAvailable, bool eventAvailable, Register&& registerDoorbell) noexcept
     {
-        // Each backend may attempt registration exactly once. Claim the
-        // unattempted state first so a repeated/concurrent call cannot replace
-        // an active binding or obscure its cleanup obligation.
-        auto expected = RxDoorbellState::Unattempted;
-        if (!m_state.compare_exchange_strong(expected, RxDoorbellState::Registering, std::memory_order_acq_rel))
         {
-            return false;
+            std::lock_guard lock{m_mutex};
+            // Registration is one-shot, and a pre-stop request permanently
+            // closes admission even when no doorbell was active yet.
+            if (m_stopRequested || m_state != RxDoorbellState::Unattempted)
+            {
+                return false;
+            }
+            m_state = RxDoorbellState::Registering;
         }
         if (!apiPairAvailable || !eventAvailable)
         {
-            m_state.store(RxDoorbellState::Disabled, std::memory_order_release);
+            {
+                std::lock_guard lock{m_mutex};
+                m_state = RxDoorbellState::Disabled;
+            }
+            m_changed.notify_all();
             return false;
         }
 
@@ -59,46 +71,136 @@ public:
         {
             registered = false;
         }
-        m_state.store(registered ? RxDoorbellState::Registered : RxDoorbellState::RegistrationFailed, std::memory_order_release);
+        {
+            std::lock_guard lock{m_mutex};
+            m_state = registered ? RxDoorbellState::Registered : RxDoorbellState::RegistrationFailed;
+        }
+        m_changed.notify_all();
         return registered;
     }
 
     template <typename Unregister>
     bool TryUnregister(Unregister&& unregisterDoorbell) noexcept
     {
-        auto expected = RxDoorbellState::Registered;
-        if (!m_state.compare_exchange_strong(expected, RxDoorbellState::Unregistering, std::memory_order_acq_rel))
         {
-            return !MustRetainEvent();
+            std::unique_lock lock{m_mutex};
+            m_changed.wait(
+                lock, [this] { return m_state != RxDoorbellState::Registering && m_state != RxDoorbellState::Unregistering; });
+            if (m_state != RxDoorbellState::Registered)
+            {
+                return !MustRetainEventLocked();
+            }
+            m_state = RxDoorbellState::Unregistering;
         }
 
-        bool unregistered{};
-        try
+        const bool unregistered = InvokeUnregister(std::forward<Unregister>(unregisterDoorbell));
         {
-            unregistered = unregisterDoorbell(RxDoorbellSpecification{});
+            std::lock_guard lock{m_mutex};
+            m_state = unregistered ? RxDoorbellState::Unregistered : RxDoorbellState::UnregisterFailed;
         }
-        catch (...)
-        {
-            unregistered = false;
-        }
-        m_state.store(unregistered ? RxDoorbellState::Unregistered : RxDoorbellState::UnregisterFailed, std::memory_order_release);
+        m_changed.notify_all();
         return unregistered;
     }
 
-    RxDoorbellState State() const noexcept { return m_state.load(std::memory_order_acquire); }
+    // Called on the host pump thread before orderly guest shutdown. Registration
+    // admission closes first; an in-flight API call is drained before deciding
+    // whether an unregister is required. No callback is disarmed here.
+    template <typename Unregister>
+    bool PrepareForGuestStop(Unregister&& unregisterDoorbell) noexcept
+    {
+        {
+            std::unique_lock lock{m_mutex};
+            m_stopRequested = true;
+            m_changed.wait(
+                lock, [this] { return m_state != RxDoorbellState::Registering && m_state != RxDoorbellState::Unregistering; });
+            switch (m_state)
+            {
+            case RxDoorbellState::Unattempted:
+            case RxDoorbellState::Disabled:
+            case RxDoorbellState::RegistrationFailed:
+            case RxDoorbellState::Unregistered:
+            case RxDoorbellState::Prepared:
+                m_state = RxDoorbellState::Prepared;
+                return true;
+            case RxDoorbellState::Registered:
+                m_state = RxDoorbellState::Unregistering;
+                break;
+            default:
+                return false;
+            }
+        }
+
+        const bool unregistered = InvokeUnregister(std::forward<Unregister>(unregisterDoorbell));
+        {
+            std::lock_guard lock{m_mutex};
+            m_state = unregistered ? RxDoorbellState::Prepared : RxDoorbellState::UnregisterFailed;
+        }
+        m_changed.notify_all();
+        return unregistered;
+    }
+
+    // This is called only after VM exit. Never invoke HDV unregister here:
+    // if preparation did not remove an active doorbell, retain its callback
+    // root and wake event rather than making an invalid post-exit API call.
+    bool CompleteAfterGuestStop() noexcept
+    {
+        std::unique_lock lock{m_mutex};
+        m_stopRequested = true;
+        m_changed.wait(
+            lock, [this] { return m_state != RxDoorbellState::Registering && m_state != RxDoorbellState::Unregistering; });
+        if (m_state == RxDoorbellState::Registered)
+        {
+            m_state = RxDoorbellState::UnregisterSkippedAfterGuestStop;
+            return false;
+        }
+        if (m_state == RxDoorbellState::UnregisterFailed || m_state == RxDoorbellState::UnregisterSkippedAfterGuestStop)
+        {
+            return false;
+        }
+        m_state = RxDoorbellState::Retired;
+        return true;
+    }
+
+    RxDoorbellState State() const noexcept
+    {
+        std::lock_guard lock{m_mutex};
+        return m_state;
+    }
     bool Active() const noexcept { return State() == RxDoorbellState::Registered; }
 
     // If unregister fails, the event may still be referenced by HDV. Keep the
     // BackendState pinned so its shared CaptureWakeSignal cannot close.
     bool MustRetainEvent() const noexcept
     {
-        const auto state = State();
-        return state == RxDoorbellState::Registering || state == RxDoorbellState::Registered || state == RxDoorbellState::Unregistering ||
-               state == RxDoorbellState::UnregisterFailed;
+        std::lock_guard lock{m_mutex};
+        return MustRetainEventLocked();
     }
 
 private:
-    std::atomic<RxDoorbellState> m_state{RxDoorbellState::Unattempted};
+    template <typename Unregister>
+    static bool InvokeUnregister(Unregister&& unregisterDoorbell) noexcept
+    {
+        try
+        {
+            return unregisterDoorbell(RxDoorbellSpecification{});
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool MustRetainEventLocked() const noexcept
+    {
+        return m_state == RxDoorbellState::Registering || m_state == RxDoorbellState::Registered ||
+               m_state == RxDoorbellState::Unregistering || m_state == RxDoorbellState::UnregisterFailed ||
+               m_state == RxDoorbellState::UnregisterSkippedAfterGuestStop;
+    }
+
+    mutable std::mutex m_mutex;
+    std::condition_variable m_changed;
+    RxDoorbellState m_state{RxDoorbellState::Unattempted};
+    bool m_stopRequested{};
 };
 
 } // namespace wsl::virtio_sound::native::windows::detail

@@ -51,10 +51,14 @@ public:
     HdvPciDeviceHost(const HdvPciDeviceHost&) = delete;
     HdvPciDeviceHost& operator=(const HdvPciDeviceHost&) = delete;
 
-    // Called by the owning WSL service after its VM has stopped. This disables
-    // pumping. UnknownOrShared retains the callback root for process lifetime
-    // and never calls HdvTeardownDeviceHost. VerifiedExclusive attempts
-    // teardown once; failure also retains the callback root and is not retried.
+    // Before orderly guest shutdown, this unregisters only the optional RX
+    // doorbell. Normal callbacks and pumping remain active until VM exit.
+    HRESULT PrepareForGuestStop() noexcept;
+
+    // Called by the owning WSL service only after confirmed VM exit. This
+    // disables pumping. UnknownOrShared retains the callback root for process
+    // lifetime and never calls HdvTeardownDeviceHost. VerifiedExclusive
+    // attempts teardown once; failure also retains the root and is not retried.
     RetireOutcome GuestStoppedAndRetire() noexcept;
     int PumpCapture(int frameBudget) noexcept;
     int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds) noexcept;

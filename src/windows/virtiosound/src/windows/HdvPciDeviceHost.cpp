@@ -950,6 +950,37 @@ public:
         return unregistered;
     }
 
+    HRESULT PrepareRxDoorbellForGuestStop() noexcept
+    {
+        HRESULT result = S_OK;
+        const bool prepared = m_rxDoorbell.PrepareForGuestStop([&](const detail::RxDoorbellSpecification& spec) {
+            try
+            {
+                const HdvApi& api = LoadApi();
+                const HDV_DEVICE device = GetDeviceHandle();
+                if (api.m_registerDoorbell == nullptr || api.m_unregisterDoorbell == nullptr || device == nullptr)
+                {
+                    result = E_HANDLE;
+                    return false;
+                }
+                result = api.m_unregisterDoorbell(
+                    device, static_cast<HDV_PCI_BAR_SELECTOR>(spec.c_barIndex), spec.c_barOffset, spec.c_triggerValue, spec.c_flags);
+                return SUCCEEDED(result);
+            }
+            catch (...)
+            {
+                result = E_FAIL;
+                return false;
+            }
+        });
+        if (!prepared && SUCCEEDED(result))
+        {
+            result = E_FAIL;
+        }
+        detail::TraceAudioSource(L"HdvRxDoorbellPrepareStop", prepared ? 1 : 0, static_cast<std::uint32_t>(result));
+        return prepared ? S_OK : result;
+    }
+
     static bool ReadGuestMemory(void* context, std::uint64_t address, std::uint8_t* destination, std::size_t byteCount) noexcept
     {
         auto* state = static_cast<BackendState*>(context);
@@ -1359,7 +1390,7 @@ RetireOutcome HdvPciDeviceHost::GuestStoppedAndRetire() noexcept
     state.m_retireOutcome = state.m_ownership == HostOwnership::VerifiedExclusive ? RetireOutcome::TeardownFailedAndPinned
                                                                                   : RetireOutcome::OwnershipUnprovenAndPinned;
     lock.unlock();
-    const bool rxDoorbellUnregistered = state.UnregisterRxDoorbell();
+    const bool rxDoorbellUnregistered = state.m_rxDoorbell.CompleteAfterGuestStop();
     const bool aperturesCleaned = state.FlushGuestMemoryAperturesForRetirement();
     TraceApertureSummary();
     // Aggregate metadata only, emitted after callbacks and pumps are drained.
@@ -1436,6 +1467,20 @@ RetireOutcome HdvPciDeviceHost::GuestStoppedAndRetire() noexcept
     state.m_retireOutcome = RetireOutcome::TeardownFailedAndPinned;
     lock.unlock(); // no automatic retry against a partial host teardown
     return RetireOutcome::TeardownFailedAndPinned;
+}
+
+HRESULT HdvPciDeviceHost::PrepareForGuestStop() noexcept
+{
+    if (!m_state)
+    {
+        return E_ABORT;
+    }
+    BackendState::Operation operation(m_state.get());
+    if (!operation)
+    {
+        return E_ABORT;
+    }
+    return m_state->PrepareRxDoorbellForGuestStop();
 }
 
 int HdvPciDeviceHost::PumpCapture(int frameBudget) noexcept

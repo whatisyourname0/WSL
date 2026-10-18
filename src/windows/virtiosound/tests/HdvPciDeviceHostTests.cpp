@@ -1294,6 +1294,7 @@ void TestOptionalDoorbellFallbackAndRegistrationFailure()
         std::lock_guard<std::mutex> lock(g_fake.mutex);
         Require(g_fake.registerDoorbellCalls == 0 && g_fake.unregisterDoorbellCalls == 0, "missing exports were retried");
     }
+    Require(SUCCEEDED(host->PrepareForGuestStop()), "disabled doorbell did not prepare for guest stop");
     Require(host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded, "fallback host did not retire normally");
     host.reset();
     wake.reset();
@@ -1336,6 +1337,7 @@ void TestOptionalDoorbellFallbackAndRegistrationFailure()
         Require(g_fake.registerDoorbellCalls == 1 && g_fake.registerDoorbellArgumentsValid, "failed registration used the wrong tuple");
         Require(g_fake.unregisterDoorbellCalls == 0, "failed registration attempted unregister");
     }
+    Require(SUCCEEDED(failedHost->PrepareForGuestStop()), "failed-registration state did not prepare for guest stop");
     Require(failedHost->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded, "registration-fallback host did not retire normally");
     failedHost.reset();
     failedWake.reset();
@@ -1385,6 +1387,8 @@ void TestExactDoorbellAndUnregisterBeforeTeardown()
         "wrong-value RX write stopped reaching legacy validation");
     Require(host->Device().GetDiagnosticsSnapshot().m_notificationFailures == 1, "wrong RX value bypassed core validation");
 
+    Require(SUCCEEDED(host->PrepareForGuestStop()), "registered doorbell did not unregister before VM shutdown");
+    Require(!host->RxDoorbellRegistered(), "pre-stop unregister left the doorbell active");
     Require(host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded, "registered doorbell host did not retire");
     {
         std::lock_guard<std::mutex> lock(g_fake.mutex);
@@ -1420,9 +1424,10 @@ void TestDoorbellUnregisterFailurePinsAndSkipsTeardown()
     (void)wake->Consume();
     (void)host->ServiceCapture(1'000'000, false);
     Require(host->RxDoorbellRegistered(), "unregister-failure setup did not register");
+    Require(FAILED(host->PrepareForGuestStop()), "uncertain pre-stop unregister was reported as successful");
     Require(
         host->GuestStoppedAndRetire() == RetireOutcome::TeardownFailedAndPinned,
-        "uncertain doorbell unregister did not fail closed");
+        "uncertain doorbell unregister did not fail closed after VM exit");
     host.reset();
     wake.reset();
     Require(!retainedWake.expired(), "uncertain unregister allowed the event to close");
@@ -1432,6 +1437,39 @@ void TestDoorbellUnregisterFailurePinsAndSkipsTeardown()
         Require(g_fake.teardownCalls == 0, "host teardown ran after uncertain unregister");
         Require(g_fake.hostLifecycleOrder == std::vector<char>{'R', 'U'}, "an operation followed uncertain unregister");
     }
+    SetDoorbellTestApis(false, false);
+}
+
+void TestUnattemptedPreparationLeavesCallbackFallbackLive()
+{
+    ResetFake();
+    SetDoorbellTestApis(true, true);
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource({}, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the pre-stop fallback owner");
+    (void)wake->Consume();
+
+    Require(SUCCEEDED(host->PrepareForGuestStop()), "unattempted adapter did not prepare for guest stop");
+    const std::array<BYTE, 2> validRxKick{3, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "normal RX callback was disabled by doorbell preparation");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "prepared host did not preserve the callback wake fallback");
+    Require(
+        wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue),
+        "prepared callback used the wrong wake reason");
+    (void)host->ServiceCapture(1'000'000, false);
+    Require(!host->RxDoorbellRegistered(), "prepared host registered a doorbell after an RX kick");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(
+            g_fake.registerDoorbellCalls == 0 && g_fake.unregisterDoorbellCalls == 0,
+            "unattempted preparation called a doorbell API");
+    }
+    Require(
+        host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "prepared, inactive doorbell host did not retire cleanly");
     SetDoorbellTestApis(false, false);
 }
 
@@ -1598,12 +1636,13 @@ void TestRetirementDrainsActiveCallback()
     Require(retireResult == RetireOutcome::OwnershipUnprovenAndPinned, "shared retirement returned the wrong outcome");
 }
 
-void TestRetirementDrainsDoorbellRegistrationBeforeUnregister()
+void TestPostExitRetirementSkipsUnpreparedDoorbellUnregister()
 {
     ResetFake();
     SetDoorbellTestApis(true, true);
     auto source = std::make_shared<GateHoldingPcmSource>();
     auto wake = std::make_shared<CaptureWakeSignal>();
+    std::weak_ptr<CaptureWakeSignal> retainedWake = wake;
     auto host = CreateStartedHostWithSource(source, wake);
     const auto callbacks = GetCallbackSnapshot();
     Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the registration-drain owner");
@@ -1681,12 +1720,18 @@ void TestRetirementDrainsDoorbellRegistrationBeforeUnregister()
     Require(serviceReachedCoreGate, "registration did not finish before ServiceCapture entered the device gate");
     Require(!retiredWhileServiceWasActive, "retirement returned while the pinned ServiceCapture operation was active");
     Require(serviceReturned.load(std::memory_order_acquire), "ServiceCapture did not finish after the gate was released");
-    Require(retireResult == RetireOutcome::TeardownSucceeded, "registration-drain host did not retire cleanly");
+    Require(retireResult == RetireOutcome::TeardownFailedAndPinned, "unprepared registration did not fail closed after VM exit");
     {
         std::lock_guard<std::mutex> lock(g_fake.mutex);
-        Require(g_fake.registerDoorbellCalls == 1 && g_fake.unregisterDoorbellCalls == 1, "registration lifecycle calls differed");
-        Require(g_fake.hostLifecycleOrder == std::vector<char>{'R', 'U', 'T'}, "retirement did not drain and unregister before teardown");
+        Require(
+            g_fake.registerDoorbellCalls == 1 && g_fake.unregisterDoorbellCalls == 0,
+            "post-exit retirement attempted HDV unregister");
+        Require(g_fake.teardownCalls == 0, "host teardown ran with an active doorbell");
+        Require(g_fake.hostLifecycleOrder == std::vector<char>{'R'}, "operation followed missing pre-stop unregister");
     }
+    host.reset();
+    wake.reset();
+    Require(!retainedWake.expired(), "missing pre-stop unregister did not retain the event");
     SetDoorbellTestApis(false, false);
 }
 
@@ -1744,6 +1789,8 @@ int main()
         std::cout << "PASS: exact RX doorbell tuple and unregister ordering\n";
         TestDoorbellUnregisterFailurePinsAndSkipsTeardown();
         std::cout << "PASS: uncertain doorbell unregister keeps the event pinned\n";
+        TestUnattemptedPreparationLeavesCallbackFallbackLive();
+        std::cout << "PASS: pre-stop closes registration admission while preserving RX callback fallback\n";
         TestAllocationFailureDoesNotAttemptEarlyDoorbellRegistration();
         std::cout << "PASS: wrapper allocation failure precedes doorbell registration\n";
         TestFailedCreateClosesAdmissionForLateCallbacks();
@@ -1752,8 +1799,8 @@ int main()
         std::cout << "PASS: null device creation rejects late callbacks\n";
         TestRetirementDrainsActiveCallback();
         std::cout << "PASS: retirement drains an admitted callback and rejects a later callback\n";
-        TestRetirementDrainsDoorbellRegistrationBeforeUnregister();
-        std::cout << "PASS: retirement drains doorbell registration before unregister\n";
+        TestPostExitRetirementSkipsUnpreparedDoorbellUnregister();
+        std::cout << "PASS: post-exit retirement skips unprepared doorbell unregister and pins safely\n";
         TestExclusiveTeardownFailureIsNotRetried();
         std::cout << "PASS: failed exclusive teardown remains pinned and is not retried\n";
         TestDestroyFailureRetainsMappingsAndPinsHost();
