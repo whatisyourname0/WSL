@@ -567,7 +567,7 @@ void TestPumpBatchReusesAndCleansApertures()
     testing::SetAperturePumpTestHook(&ExerciseGuestMemoryDuringPump, &probe);
 
     (void)host->PumpCapture(1);
-    (void)host->PumpCaptureElapsed(10'000'000);
+    (void)host->ServiceCapture(10'000'000, false);
     testing::SetAperturePumpTestHook(nullptr, nullptr);
 
     const auto stats = testing::GetGuestMemoryApertureBatchStatsForTesting();
@@ -831,7 +831,7 @@ void TestConcurrentCopyCompletesBeforeBatchDestroy()
 
     int pumpResult = -1;
     bool concurrentCopyResult{};
-    std::thread pumpThread([&] { pumpResult = host->PumpCapture(1); });
+    std::thread pumpThread([&] { pumpResult = host->ServiceCapture(1, true).m_frames; });
     auto waitForProbe = [&](bool ApertureConcurrencyProbe::* flag) {
         std::unique_lock<std::mutex> lock(probe.mutex);
         return probe.changed.wait_for(lock, std::chrono::seconds(5), [&] { return probe.*flag; });
@@ -929,7 +929,9 @@ void TestDestroyFailureRetainsMappingsAndPinsHost()
 void TestSuccessfulSharedHostRetiresPinned()
 {
     ResetFake();
-    auto host = HdvPciDeviceHost::CreateBorrowed(FakeSystem(), c_deviceClassId, c_deviceInstanceId, {}, HostOwnership::UnknownOrShared);
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    std::weak_ptr<CaptureWakeSignal> retainedWake = wake;
+    auto host = HdvPciDeviceHost::CreateBorrowed(FakeSystem(), c_deviceClassId, c_deviceInstanceId, {}, HostOwnership::UnknownOrShared, wake);
     Require(host->Ownership() == HostOwnership::UnknownOrShared, "shared host ownership was not preserved");
     const auto callbacks = GetCallbackSnapshot();
     Require(callbacks.context != nullptr, "fake HDV API did not receive callback context");
@@ -947,6 +949,20 @@ void TestSuccessfulSharedHostRetiresPinned()
         "GetDetails returned the wrong PCI identity");
     Require(probedBars[0] == 0xffffe000U, "GetDetails returned the wrong BAR size");
     Require(callbacks.deviceInterface.Start(callbacks.context) == S_OK, "Start callback failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "Start wake reason differs");
+    const UINT16 queue = 3;
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, sizeof(queue), reinterpret_cast<const BYTE*>(&queue)) == S_OK,
+        "RX queue kick failed");
+    wake->Notify(CaptureWakeReason::SourceData);
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "coalesced kick did not wake the owner");
+    Require(
+        wake->Consume() == (static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue) |
+                            static_cast<std::uint32_t>(CaptureWakeReason::SourceData)),
+        "coalescing lost a source or guest wake reason");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_TIMEOUT, "consumed event remained signaled");
 
     Require(
         host->GuestStoppedAndRetire() == RetireOutcome::OwnershipUnprovenAndPinned,
@@ -957,6 +973,8 @@ void TestSuccessfulSharedHostRetiresPinned()
     Require(
         callbacks.deviceInterface.Initialize(callbacks.context) == E_ABORT, "callback admission remained open after retirement");
     host.reset();
+    wake.reset();
+    Require(!retainedWake.expired(), "pinned callback state lost ownership of its wake event");
 
     std::lock_guard<std::mutex> lock(g_fake.mutex);
     Require(g_fake.initializeCalls == 1 && g_fake.createCalls == 1, "unexpected fake HDV create call count");

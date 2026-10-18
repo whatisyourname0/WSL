@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <string>
 #include <utility>
@@ -24,8 +25,8 @@ using wsl::virtio_sound::audio_worker::IAudioWorkerMessageEmitter;
 
 constexpr DWORD c_pipeConnectTimeoutMs = 5000U;
 constexpr DWORD c_messageTimeoutMs = 1000U;
-constexpr DWORD c_idlePollIntervalMs = 5U;
 constexpr std::size_t c_maximumPipePathCodeUnits = 256U;
+constexpr std::size_t c_maximumQueuedMessages = 2U;
 
 bool IsTerminal(AudioWorkerSessionState state) noexcept
 {
@@ -35,19 +36,45 @@ bool IsTerminal(AudioWorkerSessionState state) noexcept
 class PipeEmitter final : public IAudioWorkerMessageEmitter
 {
 public:
-    PipeEmitter(HANDLE pipe, HANDLE stopEvent) noexcept : m_pipe(pipe), m_stopEvent(stopEvent)
-    {
-    }
-
     bool Emit(const Message& message) noexcept override
     {
-        return m_writer.Write(m_pipe, m_stopEvent, c_messageTimeoutMs, message) == PipeResult::Success;
+        if (m_messages.size() >= c_maximumQueuedMessages)
+        {
+            return false;
+        }
+        try
+        {
+            m_messages.push_back(message);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool Empty() const noexcept
+    {
+        return m_messages.empty();
+    }
+
+    std::size_t Size() const noexcept
+    {
+        return m_messages.size();
+    }
+
+    const Message& Front() const noexcept
+    {
+        return m_messages.front();
+    }
+
+    void PopFront() noexcept
+    {
+        m_messages.pop_front();
     }
 
 private:
-    HANDLE m_pipe;
-    HANDLE m_stopEvent;
-    wsl::virtio_sound::audio_ipc::windows::PipeMessageWriter m_writer;
+    std::deque<Message> m_messages;
 };
 
 bool ValidatePipeArgument(const wchar_t* value, std::wstring& path)
@@ -241,58 +268,198 @@ int RunSession(HANDLE pipe, HANDLE stopEvent, HANDLE authenticatedServerProcess)
         return 69;
     }
     AudioWorkerSession session;
-    PipeEmitter emitter(pipe, stopEvent);
+    PipeEmitter emitter;
+    wsl::virtio_sound::audio_ipc::windows::PipeMessageReader reader;
+    wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter writer;
+    bool readerActive = false;
+    bool writerActive = false;
+    bool terminalOutput = false;
 
-    while (WaitForSingleObject(stopEvent, 0U) != WAIT_OBJECT_0)
+    const auto disconnect = [&]() {
+        (void)SetEvent(stopEvent);
+        reader.CancelAndDrain();
+        writer.CancelAndDrain();
+        session.OnTransportDisconnected();
+        return 2;
+    };
+
+    const auto beginWrite = [&]() -> bool {
+        if (writerActive || emitter.Empty())
+        {
+            return true;
+        }
+        const PipeResult result = writer.Begin(pipe, c_messageTimeoutMs, emitter.Front());
+        if (result != PipeResult::Pending)
+        {
+            return false;
+        }
+        emitter.PopFront();
+        writerActive = true;
+        return true;
+    };
+
+    const auto beginRead = [&]() -> bool {
+        if (readerActive || terminalOutput || IsTerminal(session.State()) || emitter.Size() >= c_maximumQueuedMessages)
+        {
+            return true;
+        }
+        const PipeResult result = reader.Begin(pipe, c_messageTimeoutMs);
+        if (result != PipeResult::Pending)
+        {
+            return false;
+        }
+        readerActive = true;
+        return true;
+    };
+
+    const auto enterTerminalOutput = [&]() {
+        if (terminalOutput || !IsTerminal(session.State()))
+        {
+            return;
+        }
+        terminalOutput = session.State() == AudioWorkerSessionState::Closed || session.State() == AudioWorkerSessionState::Faulted;
+        if (terminalOutput)
+        {
+            // No further control reads are valid after Closed/Faulted. Cancel
+            // any concurrent read while the queued terminal response drains.
+            if (readerActive)
+            {
+                reader.CancelAndDrain();
+                readerActive = false;
+            }
+        }
+    };
+
+    if (!beginRead())
     {
+        return disconnect();
+    }
+
+    for (;;)
+    {
+        // Keep process exit and explicit local stop ahead of all session work.
         const DWORD serverWait = WaitForSingleObject(authenticatedServerProcess, 0U);
         if (serverWait != WAIT_TIMEOUT)
         {
-            session.OnTransportDisconnected();
-            return 2;
+            return disconnect();
         }
-        DWORD availableBytes = 0U;
-        if (PeekNamedPipe(pipe, nullptr, 0U, nullptr, &availableBytes, nullptr) == FALSE)
+        if (WaitForSingleObject(stopEvent, 0U) == WAIT_OBJECT_0)
         {
             session.OnTransportDisconnected();
+            reader.CancelAndDrain();
+            writer.CancelAndDrain();
             return 2;
         }
 
-        if (availableBytes != 0U)
+        if (readerActive)
         {
             Message request{};
-            const PipeResult readResult = wsl::virtio_sound::audio_ipc::windows::ReadMessage(pipe, stopEvent, c_messageTimeoutMs, request);
-            if (readResult != PipeResult::Success)
+            const PipeResult readResult = reader.Advance(request);
+            if (readResult == PipeResult::Success)
             {
-                session.OnTransportDisconnected();
-                return 2;
+                readerActive = false;
+                (void)session.HandleControl(request, emitter);
+                enterTerminalOutput();
+                continue;
             }
+            if (readResult != PipeResult::Pending)
+            {
+                return disconnect();
+            }
+        }
 
-            const AudioWorkerSessionState state = session.HandleControl(request, emitter);
-            if (state == AudioWorkerSessionState::Closed)
+        if (writerActive)
+        {
+            const PipeResult writeResult = writer.Advance();
+            if (writeResult == PipeResult::Success)
             {
-                return 0;
+                writerActive = false;
             }
-            if (state == AudioWorkerSessionState::Faulted || state == AudioWorkerSessionState::Disconnected)
+            else if (writeResult != PipeResult::Pending)
             {
-                return 2;
+                return disconnect();
             }
+        }
+
+        enterTerminalOutput();
+        if (session.State() == AudioWorkerSessionState::Disconnected)
+        {
+            return disconnect();
+        }
+        if (terminalOutput && !writerActive && emitter.Empty())
+        {
+            (void)SetEvent(stopEvent);
+            return session.State() == AudioWorkerSessionState::Closed ? 0 : 2;
+        }
+
+        if (!writerActive && !emitter.Empty())
+        {
+            if (!beginWrite())
+            {
+                return disconnect();
+            }
+            // Begin may complete synchronously; advance before entering a wait.
             continue;
         }
 
-        const AudioWorkerPollResult pollResult = session.Poll(emitter);
-        if (IsTerminal(session.State()) || pollResult == AudioWorkerPollResult::Terminal)
+        if (!readerActive && !terminalOutput && emitter.Size() < c_maximumQueuedMessages)
         {
-            return session.State() == AudioWorkerSessionState::Closed ? 0 : 2;
+            if (!beginRead())
+            {
+                return disconnect();
+            }
+            // Begin always reports Pending, including immediate completion.
+            // Advance on the next pass before entering any wait.
+            continue;
         }
-        if (WaitForSingleObject(stopEvent, c_idlePollIntervalMs) == WAIT_OBJECT_0)
+        if (!terminalOutput && emitter.Empty() && session.State() == AudioWorkerSessionState::Capturing)
         {
-            break;
+            const AudioWorkerPollResult pollResult = session.Poll(emitter);
+            enterTerminalOutput();
+            if (pollResult == AudioWorkerPollResult::Terminal && session.State() == AudioWorkerSessionState::Disconnected)
+            {
+                return disconnect();
+            }
+            if (pollResult == AudioWorkerPollResult::PcmEmitted || pollResult == AudioWorkerPollResult::FaultEmitted)
+            {
+                // Process queued output before consuming another capture batch.
+                continue;
+            }
         }
-    }
 
-    session.OnTransportDisconnected();
-    return 0;
+        HANDLE waitHandles[5]{};
+        DWORD waitCount = 0U;
+        waitHandles[waitCount++] = authenticatedServerProcess;
+        waitHandles[waitCount++] = stopEvent;
+        DWORD waitTimeout = INFINITE;
+        if (readerActive)
+        {
+            waitHandles[waitCount++] = reader.Event();
+            waitTimeout = (std::min)(waitTimeout, reader.WaitTimeoutMilliseconds());
+        }
+        if (writerActive)
+        {
+            waitHandles[waitCount++] = writer.Event();
+            waitTimeout = (std::min)(waitTimeout, writer.WaitTimeoutMilliseconds());
+        }
+        const bool canConsumeCapture = !terminalOutput && emitter.Empty() && session.State() == AudioWorkerSessionState::Capturing;
+        if (canConsumeCapture)
+        {
+            const HANDLE captureEvent = static_cast<HANDLE>(session.CaptureActivityWaitHandle());
+            if (captureEvent != nullptr)
+            {
+                waitHandles[waitCount++] = captureEvent;
+            }
+        }
+
+        const DWORD waitResult = WaitForMultipleObjects(waitCount, waitHandles, FALSE, waitTimeout);
+        if (waitResult == WAIT_FAILED)
+        {
+            return disconnect();
+        }
+        // WAIT_TIMEOUT is expected for the nearest explicit reader/writer
+        // deadline. The next pass advances the operation and reports it.
+    }
 }
 
 } // namespace

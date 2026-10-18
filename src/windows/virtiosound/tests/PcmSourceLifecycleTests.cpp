@@ -2,6 +2,7 @@
 
 #include "S16LePcmRing.hpp"
 #include "VirtioSoundDevice.hpp"
+#include "../../service/exe/CaptureEventScheduler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -538,6 +539,79 @@ void TestHardwareBurstLeavesOneGuestPeriodOfRingHeadroom()
         "headroom completion publishes the third status and leaves the fourth descriptor untouched");
 }
 
+void TestEventServiceSeparatesStateFromPeriodTransfer()
+{
+    using wsl::virtio_sound::process_host::detail::CaptureEventScheduler;
+    auto source = std::make_shared<TrackingPcmSource>();
+    source->availableFrames = 0U;
+    source->readinessOnStart = SourceReadiness::Pending;
+    Fixture fixture(source);
+    Require(fixture.SetParams(7680, 1920) == c_statusOk, "four 480-frame periods fit");
+    Require(fixture.Command(0x0102U) == c_statusOk, "event PREPARE succeeds");
+    const auto start = fixture.QueueCommand(0x0104U);
+    Require(fixture.device->ProcessControlQueue() == 0, "event START waits for source readiness");
+    auto result = fixture.device->ServiceCapture(0, false);
+    Require(result.m_waitReason == CaptureWaitReason::Readiness, "pending readiness has an explicit wait reason");
+    source->readiness = SourceReadiness::Ready;
+    result = fixture.device->ServiceCapture(0, false);
+    Require(Get(fixture.guest, start.responseAddress, 4) == c_statusOk && result.m_frames == 0,
+        "ready notification completes START without granting frame transfer");
+    for (std::uint16_t i = 0; i < 4; ++i)
+    {
+        fixture.QueueRxAt(static_cast<std::uint16_t>(i + 1), i, static_cast<std::uint16_t>(i * 2),
+            static_cast<std::uint16_t>(i * 2), 0xc000ULL + i * 0x10000ULL, 0xd000ULL + i * 0x10000ULL, 480);
+    }
+    source->availableFrames = 1920;
+    CaptureEventScheduler scheduler;
+    Require(scheduler.CanTransfer(0, result.m_generation), "first source event can service data");
+    result = fixture.device->ServiceCapture(0, true);
+    scheduler.OnService(0, result);
+    Require(result.m_frames == 480 && source->availableFrames == 1440U && Get(fixture.guest, 0x9002, 2) == 1,
+        "a large hardware burst completes only one period per event service");
+    for (unsigned i = 1; i < 10; ++i)
+    {
+        const auto now = static_cast<std::uint64_t>(i) * 1'000'000;
+        result = fixture.device->ServiceCapture(1'000'000, scheduler.CanTransfer(now, result.m_generation));
+        scheduler.OnService(now, result);
+        Require(result.m_frames == 0 && result.m_waitReason == CaptureWaitReason::PacingDeadline &&
+                Get(fixture.guest, 0x9002, 2) == 1,
+            "duplicate source/RX events cannot wrap the guest ring by draining remaining data");
+    }
+    Require(scheduler.CanTransfer(10'000'000, result.m_generation), "next period is eligible after its duration");
+    result = fixture.device->ServiceCapture(1'000'000, true);
+    Require(result.m_frames == 480 && Get(fixture.guest, 0x9002, 2) == 2, "deadline permits the next whole period");
+    Require(fixture.Command(0x0105U) == c_statusOk, "STOP succeeds after event service");
+    result = fixture.device->ServiceCapture(0, true);
+    scheduler.OnService(10'000'000, result);
+    Require(result.m_frames == 0 && result.m_waitReason == CaptureWaitReason::Idle,
+        "stale source notifications after STOP cannot transfer old PCM");
+
+    auto failedSource = std::make_shared<TrackingPcmSource>();
+    failedSource->readinessOnStart = SourceReadiness::Pending;
+    Fixture failed(failedSource);
+    Require(failed.SetParams() == c_statusOk && failed.Command(0x0102U) == c_statusOk, "failure fixture prepares");
+    const auto failedStart = failed.QueueCommand(0x0104U);
+    Require(failed.device->ProcessControlQueue() == 0, "failure fixture defers START");
+    failedSource->readiness = SourceReadiness::Failed;
+    const auto failedResult = failed.device->ServiceCapture(0, false);
+    Require(failedResult.m_frames == 0 && Get(failed.guest, failedStart.responseAddress, 4) == c_statusIoError,
+        "failed readiness completes START even while frame transfers are deferred");
+
+    auto clockSource = std::make_shared<TrackingPcmSource>();
+    Fixture clockFixture(clockSource);
+    Require(clockFixture.SetParams(7680, 1920) == c_statusOk && clockFixture.Command(0x0102U) == c_statusOk &&
+            clockFixture.Command(0x0104U) == c_statusOk, "elapsed-clock source starts");
+    clockFixture.QueueRx(1, 480);
+    (void)clockFixture.device->ServiceCapture(0, false); // observe START generation
+    for (unsigned i = 0; i < 9; ++i)
+    {
+        Require(clockFixture.device->ServiceCapture(1'000'000, false).m_frames == 0,
+            "state wakes do not transfer synthetic PCM early");
+    }
+    Require(clockFixture.device->ServiceCapture(1'000'000, true).m_frames == 480,
+        "synthetic elapsed credit survives state-only wakes before its deadline");
+}
+
 void TestHardwareBufferCapacityMatchesPumpCadence()
 {
     auto source = std::make_shared<TrackingPcmSource>();
@@ -783,6 +857,7 @@ int main()
         TestPendingStartGuestWriteFailureFaultsAndDropsChain();
         TestHardwareAvailabilityBypassesStartupCreditAndBoundsHugeElapsedTime();
         TestHardwareBurstLeavesOneGuestPeriodOfRingHeadroom();
+        TestEventServiceSeparatesStateFromPeriodTransfer();
         TestHardwareBufferCapacityMatchesPumpCadence();
         TestHardwareAvailabilityLeavesZeroAndPartialDescriptorsQueued();
         TestHardwareAvailabilityDoesNotSurviveStopOrReset();

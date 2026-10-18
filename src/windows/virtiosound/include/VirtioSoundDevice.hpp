@@ -85,6 +85,28 @@ public:
     }
 };
 
+enum class CaptureWaitReason : std::uint8_t
+{
+    Idle,
+    Readiness,
+    SourceData,
+    RxBuffer,
+    PacingDeadline,
+    Progress,
+    Failed
+};
+
+struct CaptureServiceResult
+{
+    int m_frames{};
+    CaptureWaitReason m_waitReason{CaptureWaitReason::Idle};
+    std::uint64_t m_generation{};
+    std::uint32_t m_periodFrames{};
+    std::uint32_t m_sampleRate{};
+    bool m_sourceClocked{};
+    bool m_moreSourceFrames{};
+};
+
 struct DiagnosticSnapshot
 {
     bool m_rxQueueEnabled{};
@@ -152,6 +174,9 @@ public:
     // subtracts completed frames. One changed generation is observed without
     // crediting the preceding interval because its active duration is unknown.
     int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds);
+    // Event-loop entry: always service readiness/failure, but complete at most
+    // one negotiated period when transfer is permitted by the owner deadline.
+    CaptureServiceResult ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer);
     bool CaptureRunning() const noexcept;
     std::uint32_t CapturePeriodFrames() const noexcept;
     std::uint32_t MaximumCaptureFrameBudget() const noexcept;

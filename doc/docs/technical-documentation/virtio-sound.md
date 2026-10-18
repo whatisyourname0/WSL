@@ -124,13 +124,39 @@ This is a throughput constraint, not a guarantee against host scheduling stalls.
 
 ## Capture scheduling and performance diagnostics
 
-The HDV child uses monotonic absolute deadlines: 5 ms while capture is running
-and 10 ms while idle. Processing time no longer starts a fresh full wait. Missed
-deadlines are skipped, without a burst of catch-up calls. Elapsed frame credit
-still uses the measured time between pump starts; source-clocked capture still
-depends on queued input frames. Stop and parent-exit handles retain priority.
-The shorter active interval increases wakeups and is not a hard timing guarantee.
-The conservative 10 ms configuration capacity check remains unchanged.
+The HDV child waits on stop, parent exit, and a coalescing capture event. Source
+data/readiness/failure and guest RX/state changes signal that event. RX queue
+notifications remain enabled; HDV callbacks signal the owner and never transfer
+PCM themselves. A shared event owner remains alive with pinned callback state.
+The core services pending START and failure transitions even when PCM transfer
+is deferred. Source-clocked capture waits indefinitely when idle, waiting for
+readiness, missing a source period, or missing a guest RX buffer.
+
+Each service transfers at most one negotiated period. An explicit completion
+deadline prevents repeated events from granting extra sample credit. Sub-period
+lateness advances the previous absolute deadline to avoid cumulative scheduling
+drift; a delay of a full period rebases the phase rather than replaying all missed
+slots. Runnable backlog arms one deadline; synthetic input additionally uses
+deadlines to advance its sample clock. This is a bounded completion-rate policy,
+not proof that an ALSA application consumed the previous period. The conservative
+10 ms configuration capacity check remains unchanged. Scheduling stalls can
+still overflow bounded queues and must surface as errors, not dropped audio.
+
+The worker session and source controller each own one overlapped reader and
+writer, and wait on their completion events alongside state/process events.
+Readers have no idle timeout; receipt of the first byte arms a bounded partial
+frame deadline. Writes have a bounded deadline, and pending IO is canceled and
+drained before closing a pipe or releasing its buffers. Control transitions get
+an opportunity between received frames, including under continuous PCM input.
+The worker preserves response order in a bounded queue and drains Closed/Fault
+before normal exit. Authentication, restricted tokens, jobs, and frame limits
+remain in place. Bootstrap connection/handshake waits are separate from this
+steady-state loop.
+
+WASAPI waits on capture and stop events. A 1-second endpoint-health deadline
+rechecks device state if capture callbacks stop; it is not a transfer cadence.
+The controller retains its 1-second session-health check and lifecycle deadlines.
+No shared memory, zero-copy, IOCP, or interrupt coalescing is introduced here.
 
 `DiagnosticSnapshot` exposes device-lifetime saturating totals for pump calls,
 requested/completed frames, calls without a successful completion, elapsed call
@@ -145,7 +171,12 @@ pump, including direct test calls.
 After callbacks and pumps drain, guest retirement emits aggregate `CapturePump*`,
 `CaptureInterval*`, `CaptureBacklogMax`, and `CaptureScratch` events through the
 existing AudioSource ETW provider. Normal child shutdown additionally emits
-`CapturePumpSchedule`, with late ticks in `value` and skipped deadlines in `extra`.
+`CaptureWakeTotals` (event/deadline wakes), `CaptureWakeReasons` (source/guest),
+`CaptureServiceEmpty` (empty/deferred services), `CaptureServiceTime` (total/peak
+nanoseconds), and `CaptureServiceFrames`. Controller cleanup emits
+`CaptureController*` aggregates for state/IO wakes, worker exits, message/byte
+counts, busy writes, write timeouts, and peak write duration. The worker snapshot
+counts queue activity signals; these can coalesce and are not wake counts.
 Forced process exit does not guarantee a summary. No per-period ETW event is
 added by this instrumentation.
 
@@ -160,5 +191,9 @@ the writer's buffer and event can be reused with a fresh pipe.
 The [comparison benchmark](../../../src/windows/virtiosound/benchmarks/README.md)
 builds one harness against baseline and candidate core sources. Its allocation
 counts and the deterministic scheduler simulation do not measure microphone
-latency, host CPU consumption, or timer behavior under VM load. Validate those
-separately before claiming end-to-end performance gains.
+latency, host CPU consumption, or timer behavior under VM load. The event
+scheduler tests also cover repeated late wakes, long stalls, duplicate events,
+idle waits, and synthetic deadlines. Local byte-pipe tests cover partial frames,
+duplex progress, timeout, cancellation, and reuse. These checks do not exercise
+the complete authenticated process graph or physical endpoint loss. Validate
+those separately before claiming end-to-end performance gains.

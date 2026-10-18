@@ -252,7 +252,21 @@ namespace {
             return true;
         }
 
-        CaptureReadResult ReadPacket(std::chrono::milliseconds timeout, const std::atomic<bool>& stopRequested, CapturePacket& packet, CaptureError& error) override
+        CaptureReadResult ReadPacket(
+            std::chrono::milliseconds timeout,
+            const std::atomic<bool>& stopRequested,
+            CapturePacket& packet,
+            CaptureError& error) override
+        {
+            return ReadPacketInterruptible(timeout, stopRequested, 0U, packet, error);
+        }
+
+        CaptureReadResult ReadPacketInterruptible(
+            std::chrono::milliseconds timeout,
+            const std::atomic<bool>& stopRequested,
+            std::uintptr_t stopWaitHandle,
+            CapturePacket& packet,
+            CaptureError& error) override
         {
             error = {};
             packet = {};
@@ -274,15 +288,36 @@ namespace {
             }
             if (nextPacketFrames == 0)
             {
-                const auto timeoutCount = (std::max)(timeout.count(), std::chrono::milliseconds::rep{0});
+                // Keep event-driven capture idle between packets, but periodically
+                // re-enter GetNextPacketSize so endpoint invalidation is observed
+                // even if the audio engine stops producing capture callbacks.
+                constexpr auto c_endpointHealthCheckInterval = std::chrono::milliseconds{1000};
+                const auto effectiveTimeout = timeout == std::chrono::milliseconds::max()
+                    ? c_endpointHealthCheckInterval
+                    : (std::min)(timeout, c_endpointHealthCheckInterval);
+                const auto timeoutCount = (std::max)(effectiveTimeout.count(), std::chrono::milliseconds::rep{0});
                 const auto maximumWait = static_cast<std::chrono::milliseconds::rep>(MAXDWORD - 1);
                 const DWORD waitMilliseconds = static_cast<DWORD>((std::min)(timeoutCount, maximumWait));
-                const DWORD waitResult = WaitForSingleObject(m_captureEvent.get(), waitMilliseconds);
+                HANDLE waitHandles[2]{};
+                DWORD waitHandleCount = 0U;
+                DWORD stopHandleIndex = MAXDWORD;
+                if (stopWaitHandle != 0U)
+                {
+                    stopHandleIndex = waitHandleCount;
+                    waitHandles[waitHandleCount++] = reinterpret_cast<HANDLE>(stopWaitHandle);
+                }
+                const DWORD captureHandleIndex = waitHandleCount;
+                waitHandles[waitHandleCount++] = m_captureEvent.get();
+                const DWORD waitResult = WaitForMultipleObjects(waitHandleCount, waitHandles, FALSE, waitMilliseconds);
+                if (stopHandleIndex != MAXDWORD && waitResult == WAIT_OBJECT_0 + stopHandleIndex)
+                {
+                    return CaptureReadResult::Stopped;
+                }
                 if (waitResult == WAIT_TIMEOUT)
                 {
                     return stopRequested.load(std::memory_order_acquire) ? CaptureReadResult::Stopped : CaptureReadResult::Timeout;
                 }
-                if (waitResult != WAIT_OBJECT_0)
+                if (waitResult != WAIT_OBJECT_0 + captureHandleIndex)
                 {
                     const DWORD lastError = GetLastError();
                     error = {

@@ -46,6 +46,8 @@ struct FakeCaptureControl
     std::condition_variable condition;
     std::deque<CapturePacket> packets;
     bool requestReadFailure{};
+    bool waitForStopEvent{};
+    bool waitingForStopEvent{};
     std::chrono::milliseconds openDelay{};
     std::wstring openedEndpoint;
 };
@@ -111,6 +113,43 @@ public:
         packet = std::move(control_->packets.front());
         control_->packets.pop_front();
         return CaptureReadResult::Packet;
+    }
+
+    CaptureReadResult ReadPacketInterruptible(
+        std::chrono::milliseconds timeout,
+        const std::atomic<bool>& stopRequested,
+        std::uintptr_t stopWaitHandle,
+        CapturePacket& packet,
+        CaptureError& error) override
+    {
+        bool waitForStopEvent = false;
+        {
+            std::lock_guard<std::mutex> lock(control_->mutex);
+            waitForStopEvent = control_->waitForStopEvent;
+            if (waitForStopEvent)
+            {
+                control_->waitingForStopEvent = true;
+            }
+        }
+        if (!waitForStopEvent)
+        {
+            // Keep the existing fake-device path and its short bounded
+            // ReadPacket timeout for the rest of the lifecycle tests.
+            return ICaptureDevice::ReadPacketInterruptible(timeout, stopRequested, stopWaitHandle, packet, error);
+        }
+        control_->condition.notify_all();
+        if (stopWaitHandle == 0U)
+        {
+            error = {CaptureErrorCode::ReadFailed, 0, L"the fake stop event was missing"};
+            return CaptureReadResult::Failed;
+        }
+        const DWORD result = WaitForSingleObject(reinterpret_cast<HANDLE>(stopWaitHandle), INFINITE);
+        if (result == WAIT_OBJECT_0 || stopRequested.load())
+        {
+            return CaptureReadResult::Stopped;
+        }
+        error = {CaptureErrorCode::ReadFailed, static_cast<long>(HRESULT_FROM_WIN32(GetLastError())), L"fake stop-event wait failed"};
+        return CaptureReadResult::Failed;
     }
 
     bool Close(CaptureError& error) override
@@ -230,6 +269,57 @@ void TestConstructionIsInertAndStartUsesExplicitEndpoint()
     Require(worker.Stop(error), "Stop should close a running fake endpoint cleanly");
     Require(worker.Snapshot().m_state == WorkerState::Stopped, "worker must report stopped after Stop");
     Require(control->closeCalls.load() == 1, "Stop must close the capture device");
+}
+
+void TestQueueReadinessEventTracksQueuedFrames()
+{
+    auto control = std::make_shared<FakeCaptureControl>();
+    AudioCaptureWorker worker(MakeFactory(control), 16);
+    HANDLE activityEvent = static_cast<HANDLE>(worker.ActivityWaitHandle());
+    Require(activityEvent != nullptr, "worker should own a capture activity event");
+
+    CaptureError error;
+    Require(worker.Start(L"explicit-test-endpoint", error), "fake capture should start");
+    Require(
+        WaitForSingleObject(activityEvent, 0U) == WAIT_TIMEOUT,
+        "starting an idle endpoint must not leave the queue readiness event signaled");
+
+    PushPacket(control, MakePacket(4U, 20U));
+    Require(
+        WaitForSingleObject(activityEvent, 3000U) == WAIT_OBJECT_0,
+        "a queued capture packet should signal the activity event without polling");
+    Require(worker.Snapshot().m_activitySignals == 1U, "the accepted packet should record one activity signal");
+
+    std::vector<std::uint8_t> output(4U * RequiredBytesPerFrame());
+    Require(worker.ReadFrames(output.data(), 1U, RequiredBytesPerFrame()) == 1U, "the worker should allow a partial queue read");
+    Require(
+        WaitForSingleObject(activityEvent, 0U) == WAIT_OBJECT_0,
+        "the event should remain signaled while unread frames remain");
+    Require(
+        worker.ReadFrames(output.data(), 3U, 3U * RequiredBytesPerFrame()) == 3U,
+        "the rest of the queued packet should be readable");
+    Require(
+        WaitForSingleObject(activityEvent, 0U) == WAIT_TIMEOUT,
+        "draining the queue should reset the readiness event under the queue lock");
+    Require(worker.Stop(error), "Stop should close a running fake endpoint cleanly");
+}
+
+void TestStopEventInterruptsDeviceReadOnCaptureThread()
+{
+    auto control = std::make_shared<FakeCaptureControl>();
+    control->waitForStopEvent = true;
+    AudioCaptureWorker worker(MakeFactory(control), 16);
+    CaptureError error;
+    Require(worker.Start(L"explicit-test-endpoint", error), "interruptible fake capture should start");
+    Require(
+        WaitUntil([&] {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            return control->waitingForStopEvent;
+        }),
+        "capture thread should enter the stop-event wait before Stop");
+
+    Require(worker.Stop(error), "Stop should signal the wait and join the capture thread");
+    Require(control->closeCalls.load() == 1, "the capture thread should close the fake device after the stop wait");
 }
 
 void TestEndpointIdIsRequired()
@@ -395,11 +485,23 @@ void TestEndpointReadFailureIsVisible()
     Require(worker.Start(L"explicit-test-endpoint", error), "fake capture should start");
     RequestReadFailure(control);
     Require(
+        WaitForSingleObject(static_cast<HANDLE>(worker.ActivityWaitHandle()), 3000U) == WAIT_OBJECT_0,
+        "a capture failure should signal the activity event for the session owner");
+    Require(
         WaitUntil([&] { return worker.Snapshot().m_state == WorkerState::Failed; }), "endpoint read error should stop the worker");
     const WorkerSnapshot snapshot = worker.Snapshot();
     Require(snapshot.m_lastError.m_code == CaptureErrorCode::ReadFailed, "endpoint read error must be surfaced");
     Require(snapshot.m_queuedFrames == 0, "failed endpoint must not substitute synthetic audio");
     Require(!worker.Stop(error) && error.m_nativeCode == 789, "native read failure should survive Stop");
+    HANDLE activityEvent = static_cast<HANDLE>(worker.ActivityWaitHandle());
+    Require(
+        WaitForSingleObject(activityEvent, 0U) == WAIT_OBJECT_0,
+        "stopping a failed epoch should preserve its terminal activity signal");
+    Require(worker.Start(L"explicit-test-endpoint", error), "a new capture epoch should still start after failure cleanup");
+    Require(
+        WaitForSingleObject(activityEvent, 0U) == WAIT_TIMEOUT,
+        "starting a new epoch should reset the prior terminal signal");
+    Require(worker.Stop(error), "the restarted fake endpoint should stop cleanly");
 }
 
 void TestQueueResetAndWorkerCanRestart()
@@ -424,6 +526,8 @@ int main()
     try
     {
         TestConstructionIsInertAndStartUsesExplicitEndpoint();
+        TestQueueReadinessEventTracksQueuedFrames();
+        TestStopEventInterruptsDeviceReadOnCaptureThread();
         TestEndpointIdIsRequired();
         TestUnsupportedFormatFailsClosed();
         TestEndpointOpenErrorIsPreserved();

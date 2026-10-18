@@ -93,6 +93,26 @@ public:
     virtual bool Start(CaptureError& error) = 0;
     virtual CaptureReadResult ReadPacket(
         std::chrono::milliseconds timeout, const std::atomic<bool>& stopRequested, CapturePacket& packet, CaptureError& error) = 0;
+
+    // Optional interruptible adapter for devices with a native waitable stop
+    // signal. Portable/fake devices keep implementing ReadPacket; the default
+    // adapter preserves that contract. Windows WASAPI waits on both its
+    // capture event and this worker-owned event so Stop does not wait for a
+    // polling timeout.
+    virtual CaptureReadResult ReadPacketInterruptible(
+        std::chrono::milliseconds timeout,
+        const std::atomic<bool>& stopRequested,
+        std::uintptr_t stopWaitHandle,
+        CapturePacket& packet,
+        CaptureError& error)
+    {
+        (void)stopWaitHandle;
+        // Legacy/fake devices cannot wait on the native event. Keep their
+        // existing bounded-read behavior so they observe the atomic stop flag
+        // promptly even when the production WASAPI wait is indefinite.
+        constexpr std::chrono::milliseconds c_legacyReadSlice{20};
+        return ReadPacket(timeout > c_legacyReadSlice ? c_legacyReadSlice : timeout, stopRequested, packet, error);
+    }
     virtual bool Close(CaptureError& error) = 0;
 };
 
@@ -124,6 +144,7 @@ struct WorkerSnapshot
     std::uint64_t m_overflowFramesDropped{};
     std::uint64_t m_discontinuities{};
     std::uint64_t m_invalidReads{};
+    std::uint64_t m_activitySignals{};
 };
 
 // A bounded worker-owned PCM queue and lifecycle controller. Construction is
@@ -155,6 +176,12 @@ public:
     // means the queue is empty or the request is invalid. destinationByteCount
     // must exactly match the requested size.
     std::size_t ReadFrames(std::uint8_t* destination, std::size_t requestedFrames, std::size_t destinationByteCount) noexcept;
+
+    // Opaque native wait handle for queue data or a capture failure. On
+    // Windows this is a worker-owned manual-reset event valid for this
+    // AudioCaptureWorker's lifetime; elsewhere it is null. Consumers should
+    // stop waiting on it once the session is terminal.
+    void* ActivityWaitHandle() const noexcept;
 
     WorkerSnapshot Snapshot() const;
 

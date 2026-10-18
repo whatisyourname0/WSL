@@ -147,6 +147,11 @@ AudioWorkerSessionState AudioWorkerSession::State() const noexcept
     return m_state;
 }
 
+void* AudioWorkerSession::CaptureActivityWaitHandle() const noexcept
+{
+    return m_worker.ActivityWaitHandle();
+}
+
 bool AudioWorkerSession::IsImmediatelyAfter(std::uint64_t previous, std::uint64_t candidate) noexcept
 {
     return previous != c_maximumSequence && candidate == previous + 1U;

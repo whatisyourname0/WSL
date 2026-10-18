@@ -51,9 +51,9 @@ enum class AudioWorkerPollResult
 };
 
 // Emit is called synchronously on the adapter's control thread. Implementations
-// must serialize/write the message before returning, must not retain its
-// reference, and must not reenter AudioWorkerSession. False means that the
-// transport is disconnected. The adapter never queues outbound messages.
+// must accept a bounded copy of the message before returning, must not retain
+// its reference, and must not reenter AudioWorkerSession. False means that the
+// transport has no capacity or is disconnected.
 class IAudioWorkerMessageEmitter
 {
 public:
@@ -86,10 +86,13 @@ public:
     AudioWorkerSessionState HandleControl(const audio_ipc::Message& request, IAudioWorkerMessageEmitter& emitter) noexcept;
 
     // Poll does not wait for new PCM and emits no more than one PCM or Fault
-    // response, with PCM capped at 48,000 frames / 192,000 bytes. It can block
-    // while the synchronous emitter writes or while failure cleanup joins the
-    // capture worker; a future process supervisor must enforce a hard deadline.
+    // response, with PCM capped at 48,000 frames / 192,000 bytes. Failure cleanup
+    // may join the capture worker on this owner thread.
     AudioWorkerPollResult Poll(IAudioWorkerMessageEmitter& emitter) noexcept;
+
+    // Opaque native wait handle for capture queue data or a terminal capture
+    // failure. It is owned by the AudioWorkerSession and valid for its lifetime.
+    void* CaptureActivityWaitHandle() const noexcept;
 
     // Call after pipe/transport loss. It stops the worker and never reopens an
     // endpoint. Stop joins the existing capture thread and has no hard deadline;

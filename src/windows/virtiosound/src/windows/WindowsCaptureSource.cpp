@@ -26,6 +26,7 @@
 #include "AudioSourceTrace.hpp"
 #include "AudioIpcCodec.hpp"
 #include "AudioPipeTransport.hpp"
+#include "CaptureWakeSignal.hpp"
 #include "S16LePcmRing.hpp"
 #include "CaptureStopDeadline.hpp"
 
@@ -33,7 +34,6 @@ namespace wsl::virtio_sound::native::windows {
 namespace {
 
     using namespace std::chrono_literals;
-    using wsl::virtio_sound::audio_ipc::Header;
     using wsl::virtio_sound::audio_ipc::Message;
     using wsl::virtio_sound::audio_ipc::MessageType;
 
@@ -47,9 +47,9 @@ namespace {
     constexpr DWORD c_workerStartTimeoutMs = 750U;
     constexpr DWORD c_workerStopTimeoutMs = 2000U;
     constexpr DWORD c_workerCloseTimeoutMs = 2000U;
-    constexpr DWORD c_controllerCadenceMs = 5U;
     constexpr DWORD c_sessionCheckCadenceMs = 1000U;
     constexpr DWORD c_partialFrameTimeoutMs = 1000U;
+    constexpr DWORD c_workerExitDrainTimeoutMs = 1000U;
     using WtsMemory = wil::unique_any<PVOID, decltype(&WTSFreeMemory), WTSFreeMemory>;
     using EnvironmentBlock = wil::unique_any<LPVOID, decltype(&DestroyEnvironmentBlock), DestroyEnvironmentBlock>;
 
@@ -308,12 +308,57 @@ namespace {
                message.m_header.m_epoch == epoch && message.m_header.m_sequence == sequence && message.m_payload.empty();
     }
 
+    void AddSaturating(std::uint64_t& total, std::uint64_t amount) noexcept
+    {
+        const std::uint64_t maximum = (std::numeric_limits<std::uint64_t>::max)();
+        total = amount > maximum - total ? maximum : total + amount;
+    }
+
+    DWORD RemainingMilliseconds(std::chrono::steady_clock::time_point deadline, std::chrono::steady_clock::time_point now) noexcept
+    {
+        if (deadline <= now)
+        {
+            return 0U;
+        }
+        const auto remaining = deadline - now;
+        auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+        if (std::chrono::milliseconds(milliseconds) < remaining)
+        {
+            ++milliseconds;
+        }
+        return milliseconds >= static_cast<decltype(milliseconds)>(INFINITE) ? INFINITE - 1U : static_cast<DWORD>(milliseconds);
+    }
+
+    class AsyncPipeDrainOnExit final
+    {
+    public:
+        AsyncPipeDrainOnExit(
+            wsl::virtio_sound::audio_ipc::windows::PipeMessageReader& reader,
+            wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter& writer) noexcept : m_reader(reader), m_writer(writer)
+        {
+        }
+
+        ~AsyncPipeDrainOnExit() noexcept
+        {
+            m_reader.CancelAndDrain();
+            m_writer.CancelAndDrain();
+        }
+
+        AsyncPipeDrainOnExit(const AsyncPipeDrainOnExit&) = delete;
+        AsyncPipeDrainOnExit& operator=(const AsyncPipeDrainOnExit&) = delete;
+
+    private:
+        wsl::virtio_sound::audio_ipc::windows::PipeMessageReader& m_reader;
+        wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter& m_writer;
+    };
+
 } // namespace
 
 class WindowsCaptureSource::Impl final
 {
 public:
-    explicit Impl(std::size_t capacityFrames) : m_ring(PcmFormat{}, capacityFrames)
+    explicit Impl(std::size_t capacityFrames, std::shared_ptr<CaptureWakeSignal> wakeSignal)
+        : m_ring(PcmFormat{}, capacityFrames), m_wakeSignal(std::move(wakeSignal))
     {
         (void)m_ring.CapacityFrames();
     }
@@ -385,6 +430,10 @@ public:
             throw std::runtime_error("Unable to initialize the capture PCM ring");
         }
         m_readiness = SourceReadiness::Ready;
+        if (m_wakeSignal)
+        {
+            m_wakeSignal->Notify(CaptureWakeReason::SourceState);
+        }
         m_controller = std::thread([this]() noexcept { ControllerMain(); });
     }
 
@@ -429,6 +478,10 @@ public:
         {
             (void)SetEvent(m_wakeEvent.get());
         }
+        if (m_wakeSignal)
+        {
+            m_wakeSignal->Notify(CaptureWakeReason::SourceState);
+        }
         return result;
     }
 
@@ -450,8 +503,7 @@ public:
             {
                 if (m_desiredRunning || m_wirePhase != WirePhase::Idle)
                 {
-                    m_stopDeadline.OnStopOrResetRequest(
-                        m_wirePhase, std::chrono::steady_clock::now(), std::chrono::milliseconds(c_workerStopTimeoutMs));
+                    ArmStopDeadlineOnStopOrResetLocked(std::chrono::steady_clock::now());
                 }
                 m_desiredRunning = false;
                 m_desiredPeriodFrames = 0U;
@@ -462,6 +514,10 @@ public:
         if (m_wakeEvent)
         {
             (void)SetEvent(m_wakeEvent.get());
+        }
+        if (m_wakeSignal)
+        {
+            m_wakeSignal->Notify(CaptureWakeReason::SourceState);
         }
     }
 
@@ -524,8 +580,7 @@ public:
             {
                 if (m_desiredRunning || m_wirePhase != WirePhase::Idle)
                 {
-                    m_stopDeadline.OnStopOrResetRequest(
-                        m_wirePhase, std::chrono::steady_clock::now(), std::chrono::milliseconds(c_workerStopTimeoutMs));
+                    ArmStopDeadlineOnStopOrResetLocked(std::chrono::steady_clock::now());
                 }
                 m_desiredRunning = false;
                 m_desiredPeriodFrames = 0U;
@@ -536,6 +591,10 @@ public:
         if (m_wakeEvent)
         {
             (void)SetEvent(m_wakeEvent.get());
+        }
+        if (m_wakeSignal)
+        {
+            m_wakeSignal->Notify(CaptureWakeReason::SourceState);
         }
     }
 
@@ -567,12 +626,16 @@ public:
             }
             if (m_wirePhase != WirePhase::Idle && m_wirePhase != WirePhase::Closed)
             {
-                m_stopDeadline.ArmIfMissing(std::chrono::steady_clock::now(), std::chrono::milliseconds(c_workerStopTimeoutMs));
+                ArmStopDeadlineIfMissingLocked(std::chrono::steady_clock::now());
             }
         }
         if (m_wakeEvent)
         {
             (void)SetEvent(m_wakeEvent.get());
+        }
+        if (m_wakeSignal)
+        {
+            m_wakeSignal->Notify(CaptureWakeReason::SourceState);
         }
         if (m_controller.joinable())
         {
@@ -593,14 +656,6 @@ public:
 private:
     using WirePhase = detail::CaptureStopDeadline::Phase;
 
-    enum class PeekResult
-    {
-        NoMessage,
-        CompleteMessage,
-        InvalidFrame,
-        Disconnected,
-    };
-
     void SetFailedLocked() noexcept
     {
         m_terminalFailure = true;
@@ -611,6 +666,48 @@ private:
         const auto previousResetFailures = m_ring.Snapshot().m_resetFailures;
         m_ring.Reset();
         (void)previousResetFailures;
+        if (m_wakeSignal)
+        {
+            m_wakeSignal->Notify(CaptureWakeReason::SourceState);
+        }
+    }
+
+    void ArmStopDeadlineIfMissingLocked(std::chrono::steady_clock::time_point now) noexcept
+    {
+        m_stopDeadline.ArmIfMissing(now, std::chrono::milliseconds(c_workerStopTimeoutMs));
+        if (!m_controllerStopDeadline)
+        {
+            m_controllerStopDeadline = now + std::chrono::milliseconds(c_workerStopTimeoutMs);
+        }
+    }
+
+    void ArmStopDeadlineOnStopOrResetLocked(std::chrono::steady_clock::time_point now) noexcept
+    {
+        const bool active = m_wirePhase == WirePhase::StartSent || m_wirePhase == WirePhase::Capturing || m_wirePhase == WirePhase::StopSent;
+        m_stopDeadline.OnStopOrResetRequest(m_wirePhase, now, std::chrono::milliseconds(c_workerStopTimeoutMs));
+        if (active)
+        {
+            const auto candidate = now + std::chrono::milliseconds(c_workerStopTimeoutMs);
+            if (!m_controllerStopDeadline || candidate < *m_controllerStopDeadline)
+            {
+                m_controllerStopDeadline = candidate;
+            }
+        }
+    }
+
+    void AfterStartSentLocked(bool desiredEpochStillMatches, std::chrono::steady_clock::time_point now) noexcept
+    {
+        m_stopDeadline.AfterStartSent(desiredEpochStillMatches, now, std::chrono::milliseconds(c_workerStopTimeoutMs));
+        if (!desiredEpochStillMatches)
+        {
+            ArmStopDeadlineIfMissingLocked(now);
+        }
+    }
+
+    void AfterStopSentLocked(std::chrono::steady_clock::time_point now) noexcept
+    {
+        m_stopDeadline.AfterStopSent(now, std::chrono::milliseconds(c_workerStopTimeoutMs));
+        ArmStopDeadlineIfMissingLocked(now);
     }
 
     void MarkFailed(std::uint32_t location = 0) noexcept
@@ -903,14 +1000,12 @@ private:
         return candidate != 0U;
     }
 
-    bool SendControl(MessageType type, std::uint64_t epoch, std::uint64_t& lastOutboundSequence)
+    bool BuildControlMessage(MessageType type, std::uint64_t epoch, std::uint64_t lastOutboundSequence, Message& message, std::uint64_t& sequence) const
     {
-        std::uint64_t sequence = 0U;
         if (!NextSequence(lastOutboundSequence, sequence))
         {
             return false;
         }
-        Message message{};
         message.m_header.m_type = type;
         message.m_header.m_epoch = epoch;
         message.m_header.m_sequence = sequence;
@@ -924,70 +1019,7 @@ private:
         }
         message.m_header.m_payloadBytes = static_cast<std::uint32_t>(message.m_payload.size());
         wsl::virtio_sound::audio_ipc::Error error{};
-        if (!wsl::virtio_sound::audio_ipc::ValidateMessage(message, error) ||
-            !IsSuccessfulPipeResult(wsl::virtio_sound::audio_ipc::windows::WriteMessage(
-                m_pipe.get(), m_transportCancelEvent.get(), c_pipeMessageTimeoutMs, message)))
-        {
-            return false;
-        }
-        lastOutboundSequence = sequence;
-        return true;
-    }
-
-    PeekResult PeekCompleteMessage(Message& message, std::chrono::steady_clock::time_point& partialFrameStart)
-    {
-        std::array<std::uint8_t, wsl::virtio_sound::audio_ipc::c_headerBytes> bytes{};
-        DWORD bytesRead = 0U;
-        DWORD totalBytesAvailable = 0U;
-        if (PeekNamedPipe(m_pipe.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &bytesRead, &totalBytesAvailable, nullptr) == FALSE)
-        {
-            return PeekResult::Disconnected;
-        }
-        if (totalBytesAvailable == 0U)
-        {
-            partialFrameStart = std::chrono::steady_clock::time_point{};
-            return PeekResult::NoMessage;
-        }
-        if (bytesRead < bytes.size())
-        {
-            if (partialFrameStart == std::chrono::steady_clock::time_point{})
-            {
-                partialFrameStart = std::chrono::steady_clock::now();
-            }
-            if (std::chrono::steady_clock::now() - partialFrameStart > std::chrono::milliseconds(c_partialFrameTimeoutMs))
-            {
-                return PeekResult::InvalidFrame;
-            }
-            return PeekResult::NoMessage;
-        }
-        Header header{};
-        wsl::virtio_sound::audio_ipc::Error error{};
-        if (!wsl::virtio_sound::audio_ipc::DecodeHeader(bytes.data(), bytes.size(), header, error))
-        {
-            return PeekResult::InvalidFrame;
-        }
-        const std::size_t frameBytes = wsl::virtio_sound::audio_ipc::c_headerBytes + static_cast<std::size_t>(header.m_payloadBytes);
-        if (totalBytesAvailable < frameBytes)
-        {
-            if (partialFrameStart == std::chrono::steady_clock::time_point{})
-            {
-                partialFrameStart = std::chrono::steady_clock::now();
-            }
-            if (std::chrono::steady_clock::now() - partialFrameStart > std::chrono::milliseconds(c_partialFrameTimeoutMs))
-            {
-                return PeekResult::InvalidFrame;
-            }
-            return PeekResult::NoMessage;
-        }
-        partialFrameStart = std::chrono::steady_clock::time_point{};
-        const auto result =
-            wsl::virtio_sound::audio_ipc::windows::ReadMessage(m_pipe.get(), m_transportCancelEvent.get(), c_pipeMessageTimeoutMs, message);
-        if (!IsSuccessfulPipeResult(result))
-        {
-            return result == wsl::virtio_sound::audio_ipc::windows::PipeResult::Disconnected ? PeekResult::Disconnected
-                                                                                             : PeekResult::InvalidFrame;
-        }
-        return PeekResult::CompleteMessage;
+        return wsl::virtio_sound::audio_ipc::ValidateMessage(message, error);
     }
 
     bool ValidateInboundSequence(const Message& message, std::uint64_t& lastInboundSequence) const noexcept
@@ -1013,6 +1045,10 @@ private:
         m_wireEpoch = epoch;
         m_wireGeneration = generation;
         m_stopDeadline.OnWirePhaseChanged(phase);
+        if (phase == WirePhase::Idle || phase == WirePhase::Closed || phase == WirePhase::ShutdownSent)
+        {
+            m_controllerStopDeadline.reset();
+        }
     }
 
     bool IsSessionStillActive() const noexcept
@@ -1043,47 +1079,6 @@ private:
                 (void)WaitForSingleObject(m_process.get(), 2000U);
             }
         }
-    }
-
-    bool StartWorkerEpoch(std::uint64_t epoch, std::uint64_t generation, std::uint64_t& lastOutboundSequence)
-    {
-        if (!SendControl(MessageType::Start, epoch, lastOutboundSequence))
-        {
-            return false;
-        }
-        SetWirePhase(WirePhase::StartSent, epoch, generation);
-        {
-            auto stateLock = m_stateLock.lock_exclusive();
-            m_stopDeadline.AfterStartSent(
-                m_desiredRunning && m_desiredEpoch == epoch, std::chrono::steady_clock::now(), std::chrono::milliseconds(c_workerStopTimeoutMs));
-        }
-        return true;
-    }
-
-    bool StopWorkerEpoch(std::uint64_t epoch, std::uint64_t& lastOutboundSequence)
-    {
-        if (!SendControl(MessageType::Stop, epoch, lastOutboundSequence))
-        {
-            return false;
-        }
-        SetWirePhase(WirePhase::StopSent, epoch);
-        {
-            auto stateLock = m_stateLock.lock_exclusive();
-            m_stopDeadline.AfterStopSent(std::chrono::steady_clock::now(), std::chrono::milliseconds(c_workerStopTimeoutMs));
-        }
-        return true;
-    }
-
-    bool SendShutdown(std::uint64_t& lastOutboundSequence)
-    {
-        if (!SendControl(MessageType::Shutdown, 0U, lastOutboundSequence))
-        {
-            return false;
-        }
-        SetWirePhase(WirePhase::ShutdownSent, 0U);
-        auto stateLock = m_stateLock.lock_exclusive();
-        m_shutdownDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(c_workerCloseTimeoutMs);
-        return true;
     }
 
     bool CheckDeadlines(WirePhase phase, std::chrono::steady_clock::time_point now) noexcept
@@ -1160,12 +1155,16 @@ private:
                 }
                 if (!m_desiredRunning || m_desiredEpoch != activeEpoch || m_desiredGeneration != activeGeneration)
                 {
-                    m_stopDeadline.ArmIfMissing(std::chrono::steady_clock::now(), std::chrono::milliseconds(c_workerStopTimeoutMs));
+                    ArmStopDeadlineIfMissingLocked(std::chrono::steady_clock::now());
                 }
             }
             if (becameReady)
             {
                 detail::TraceAudioSource(L"CaptureReady", activeEpoch, activeGeneration);
+                if (m_wakeSignal)
+                {
+                    m_wakeSignal->Notify(CaptureWakeReason::SourceState);
+                }
             }
             return true;
         }
@@ -1212,12 +1211,18 @@ private:
                 return false;
             }
             std::uint32_t periodFrames = 0U;
+            bool currentEpochWritten = false;
             {
                 auto stateLock = m_stateLock.lock_exclusive();
                 if (m_desiredRunning && m_desiredEpoch == activeEpoch && m_desiredGeneration == activeGeneration)
                 {
                     periodFrames = m_desiredPeriodFrames;
+                    currentEpochWritten = true;
                 }
+            }
+            if (currentEpochWritten && m_wakeSignal)
+            {
+                m_wakeSignal->Notify(CaptureWakeReason::SourceData);
             }
             if (periodFrames != 0U)
             {
@@ -1257,12 +1262,28 @@ private:
         }
     }
 
+    struct ControllerMetrics
+    {
+        std::uint64_t stateWakes{};
+        std::uint64_t readerWakes{};
+        std::uint64_t writerWakes{};
+        std::uint64_t processExits{};
+        std::uint64_t inboundMessages{};
+        std::uint64_t inboundBytes{};
+        std::uint64_t outboundMessages{};
+        std::uint64_t outboundBytes{};
+        std::uint64_t busyWrites{};
+        std::uint64_t writeTimeouts{};
+        std::uint64_t maximumWriteDurationMs{};
+    };
+
     void ControllerMain() noexcept
     {
+        ControllerMetrics metrics{};
         bool gracefulClose = false;
         try
         {
-            gracefulClose = RunController();
+            gracefulClose = RunController(metrics);
         }
         catch (...)
         {
@@ -1272,7 +1293,11 @@ private:
         if (gracefulClose)
         {
             const DWORD waitResult = m_process ? WaitForSingleObject(m_process.get(), c_workerCloseTimeoutMs) : WAIT_OBJECT_0;
-            if (waitResult != WAIT_OBJECT_0)
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                AddSaturating(metrics.processExits, 1U);
+            }
+            else
             {
                 ForceTerminateWorker();
             }
@@ -1281,22 +1306,223 @@ private:
         {
             ForceTerminateWorker();
         }
+        if (m_process && WaitForSingleObject(m_process.get(), 0U) == WAIT_OBJECT_0 && metrics.processExits == 0U)
+        {
+            AddSaturating(metrics.processExits, 1U);
+        }
         m_pipe.reset();
+        detail::TraceAudioSource(L"CaptureControllerWake", metrics.stateWakes, metrics.readerWakes);
+        detail::TraceAudioSource(L"CaptureControllerWriterWake", metrics.writerWakes);
+        detail::TraceAudioSource(L"CaptureControllerWorkerExit", metrics.processExits);
+        detail::TraceAudioSource(L"CaptureControllerRx", metrics.inboundMessages, metrics.inboundBytes);
+        detail::TraceAudioSource(L"CaptureControllerTx", metrics.outboundMessages, metrics.outboundBytes);
+        detail::TraceAudioSource(L"CaptureControllerWrites", metrics.busyWrites, metrics.writeTimeouts);
+        detail::TraceAudioSource(L"CaptureControllerWritePeakMs", metrics.maximumWriteDurationMs);
         {
             auto stateLock = m_stateLock.lock_exclusive();
             m_controllerFinished = true;
         }
     }
 
-    bool RunController()
+    bool RunController(ControllerMetrics& metrics)
     {
+        using PipeResult = wsl::virtio_sound::audio_ipc::windows::PipeResult;
+        enum class ControlAction : std::uint8_t
+        {
+            None,
+            Start,
+            Stop,
+            Shutdown,
+        };
+
+        wsl::virtio_sound::audio_ipc::windows::PipeMessageReader reader;
+        wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter writer;
+        AsyncPipeDrainOnExit drainOnExit(reader, writer);
+        (void)drainOnExit;
+        bool readerActive = false;
+        bool writerActive = false;
+        ControlAction pendingAction = ControlAction::None;
+        std::uint64_t pendingSequence = 0U;
+        std::uint64_t pendingEpoch = 0U;
+        std::uint64_t pendingGeneration = 0U;
+        std::uint64_t pendingWireBytes = 0U;
+        std::chrono::steady_clock::time_point writeStarted{};
+        bool writeWaitCounted = false;
+
         WirePhase phase = WirePhase::Idle;
         std::uint64_t activeEpoch = 0U;
         std::uint64_t activeGeneration = 0U;
         std::uint64_t lastOutboundSequence = m_lastOutboundSequence;
         std::uint64_t lastInboundSequence = m_lastInboundSequence;
         std::chrono::steady_clock::time_point nextSessionCheck{};
-        std::chrono::steady_clock::time_point partialFrameStart{};
+
+        const auto initialReader = reader.Begin(m_pipe.get(), c_partialFrameTimeoutMs);
+        if (initialReader != PipeResult::Pending)
+        {
+            return false;
+        }
+        readerActive = true;
+
+        auto recordInbound = [&](const Message& message) noexcept {
+            AddSaturating(metrics.inboundMessages, 1U);
+            AddSaturating(
+                metrics.inboundBytes,
+                static_cast<std::uint64_t>(wsl::virtio_sound::audio_ipc::c_headerBytes) + static_cast<std::uint64_t>(message.m_payload.size()));
+        };
+
+        auto completeControlWrite = [&]() noexcept -> PipeResult {
+            if (!writerActive)
+            {
+                return PipeResult::Success;
+            }
+            const PipeResult result = writer.Advance();
+            if (result == PipeResult::Pending)
+            {
+                if (!writeWaitCounted)
+                {
+                    AddSaturating(metrics.busyWrites, 1U);
+                    writeWaitCounted = true;
+                }
+                return result;
+            }
+            writerActive = false;
+            writeWaitCounted = false;
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - writeStarted).count();
+            if (elapsed > 0)
+            {
+                metrics.maximumWriteDurationMs = (std::max)(metrics.maximumWriteDurationMs, static_cast<std::uint64_t>(elapsed));
+            }
+            if (result == PipeResult::Timeout)
+            {
+                AddSaturating(metrics.writeTimeouts, 1U);
+            }
+            if (result != PipeResult::Success)
+            {
+                return result;
+            }
+
+            AddSaturating(metrics.outboundMessages, 1U);
+            AddSaturating(metrics.outboundBytes, pendingWireBytes);
+            lastOutboundSequence = pendingSequence;
+
+            switch (pendingAction)
+            {
+            case ControlAction::Start:
+                activeEpoch = pendingEpoch;
+                activeGeneration = pendingGeneration;
+                phase = WirePhase::StartSent;
+                SetWirePhase(phase, activeEpoch, activeGeneration);
+                {
+                    auto stateLock = m_stateLock.lock_exclusive();
+                    AfterStartSentLocked(m_desiredRunning && m_desiredEpoch == activeEpoch, now);
+                }
+                break;
+            case ControlAction::Stop:
+                phase = WirePhase::StopSent;
+                SetWirePhase(phase, activeEpoch);
+                {
+                    auto stateLock = m_stateLock.lock_exclusive();
+                    AfterStopSentLocked(now);
+                }
+                break;
+            case ControlAction::Shutdown:
+                phase = WirePhase::ShutdownSent;
+                SetWirePhase(phase, 0U);
+                {
+                    auto stateLock = m_stateLock.lock_exclusive();
+                    m_shutdownDeadline = now + std::chrono::milliseconds(c_workerCloseTimeoutMs);
+                }
+                break;
+            case ControlAction::None:
+            default:
+                return PipeResult::IoError;
+            }
+            pendingAction = ControlAction::None;
+            return result;
+        };
+
+        auto beginControlWrite = [&](ControlAction action, MessageType type, std::uint64_t epoch, std::uint64_t generation) -> bool {
+            Message outgoing{};
+            std::uint64_t sequence = 0U;
+            if (!BuildControlMessage(type, epoch, lastOutboundSequence, outgoing, sequence))
+            {
+                return false;
+            }
+            if (writer.Begin(m_pipe.get(), c_pipeMessageTimeoutMs, outgoing) != PipeResult::Pending)
+            {
+                return false;
+            }
+            pendingAction = action;
+            pendingSequence = sequence;
+            pendingEpoch = epoch;
+            pendingGeneration = generation;
+            pendingWireBytes = static_cast<std::uint64_t>(wsl::virtio_sound::audio_ipc::c_headerBytes) + outgoing.m_payload.size();
+            writeStarted = std::chrono::steady_clock::now();
+            writeWaitCounted = false;
+            writerActive = true;
+            return true;
+        };
+
+        auto drainFinalWorkerMessages = [&]() {
+            // The worker has exited, so the pipe can only contain a bounded
+            // tail of messages. Keep consuming complete frames long enough to
+            // retain a final Fault diagnostic, then cancel/drain any partial
+            // read before RunController releases the borrowed pipe handle.
+            const auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(c_workerExitDrainTimeoutMs);
+            for (unsigned remaining = 32U; remaining != 0U; --remaining)
+            {
+                if (!readerActive)
+                {
+                    if (reader.Begin(m_pipe.get(), c_partialFrameTimeoutMs) != PipeResult::Pending)
+                    {
+                        return false;
+                    }
+                    readerActive = true;
+                }
+                Message finalMessage{};
+                const PipeResult result = reader.Advance(finalMessage);
+                if (result == PipeResult::Success)
+                {
+                    readerActive = false;
+                    recordInbound(finalMessage);
+                    if (!HandleInbound(finalMessage, phase, activeEpoch, activeGeneration, lastInboundSequence))
+                    {
+                        return false;
+                    }
+                    if (phase == WirePhase::Closed)
+                    {
+                        return true;
+                    }
+                    continue;
+                }
+                if (result == PipeResult::Disconnected)
+                {
+                    readerActive = false;
+                    return false;
+                }
+                if (result != PipeResult::Pending)
+                {
+                    readerActive = false;
+                    return false;
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                const DWORD remainingDrain = RemainingMilliseconds(drainDeadline, now);
+                if (remainingDrain == 0U)
+                {
+                    return false;
+                }
+                const DWORD partialTimeout = reader.WaitTimeoutMilliseconds();
+                const DWORD waitMs = (std::min)(remainingDrain, partialTimeout);
+                const DWORD waitResult = WaitForSingleObject(reader.Event(), waitMs);
+                if (waitResult == WAIT_FAILED || waitResult == WAIT_TIMEOUT)
+                {
+                    return false;
+                }
+            }
+            return false;
+        };
 
         for (;;)
         {
@@ -1306,21 +1532,9 @@ private:
                 DWORD exitCode = MAXDWORD;
                 (void)GetExitCodeProcess(m_process.get(), &exitCode);
                 detail::TraceAudioSource(L"WorkerExited", exitCode);
-                // A worker can emit Fault then exit between controller polls.
-                // Preserve those already-buffered diagnostics before closing
-                // the pipe. The worker is dead, so there is no producer; only
-                // fully available, protocol-validated frames are consumed.
-                for (unsigned remaining = 32; remaining != 0; --remaining)
+                if (drainFinalWorkerMessages())
                 {
-                    Message finalMessage{};
-                    if (PeekCompleteMessage(finalMessage, partialFrameStart) != PeekResult::CompleteMessage)
-                    {
-                        break;
-                    }
-                    if (!HandleInbound(finalMessage, phase, activeEpoch, activeGeneration, lastInboundSequence))
-                    {
-                        break;
-                    }
+                    return true;
                 }
                 MarkFailed(__LINE__);
                 return false;
@@ -1347,6 +1561,17 @@ private:
                 MarkFailed(__LINE__);
                 return false;
             }
+            bool pendingStartDeadlineExpired = false;
+            if (writerActive && pendingAction == ControlAction::Start)
+            {
+                auto stateLock = m_stateLock.lock_shared();
+                pendingStartDeadlineExpired = now >= m_startDeadline;
+            }
+            if (pendingStartDeadlineExpired)
+            {
+                MarkFailed(__LINE__);
+                return false;
+            }
 
             if (phase == WirePhase::StartSent || phase == WirePhase::Capturing || phase == WirePhase::StopSent)
             {
@@ -1364,66 +1589,42 @@ private:
             if (phase == WirePhase::StartSent && (!desiredRunning || desiredEpoch != activeEpoch))
             {
                 auto stateLock = m_stateLock.lock_exclusive();
-                m_stopDeadline.ArmIfMissing(now, std::chrono::milliseconds(c_workerStopTimeoutMs));
+                ArmStopDeadlineIfMissingLocked(now);
             }
 
-            if (shuttingDown && phase == WirePhase::Idle)
+            if (writerActive)
             {
-                if (!SendShutdown(lastOutboundSequence))
+                const PipeResult writeResult = completeControlWrite();
+                if (writeResult == PipeResult::Success && pendingAction == ControlAction::None && !writerActive)
                 {
-                    MarkFailed(__LINE__);
-                    return false;
-                }
-                phase = WirePhase::ShutdownSent;
-                continue;
-            }
-            if (!shuttingDown && phase == WirePhase::Idle && desiredRunning)
-            {
-                if (!StartWorkerEpoch(desiredEpoch, desiredGeneration, lastOutboundSequence))
-                {
-                    MarkFailed(__LINE__);
-                    return false;
-                }
-                phase = WirePhase::StartSent;
-                activeEpoch = desiredEpoch;
-                activeGeneration = desiredGeneration;
-                continue;
-            }
-            if ((phase == WirePhase::Capturing || phase == WirePhase::StartSent) && (!desiredRunning || desiredEpoch != activeEpoch))
-            {
-                // A Start already accepted by the worker must be acknowledged
-                // before its exact epoch can be stopped.
-                if (phase == WirePhase::Capturing)
-                {
-                    if (!StopWorkerEpoch(activeEpoch, lastOutboundSequence))
-                    {
-                        MarkFailed(__LINE__);
-                        return false;
-                    }
-                    phase = WirePhase::StopSent;
+                    // The next state transition is derived from the new wire
+                    // phase and desired state at the top of the next iteration.
                     continue;
                 }
-            }
-            if (shuttingDown && phase == WirePhase::Capturing)
-            {
-                if (!StopWorkerEpoch(activeEpoch, lastOutboundSequence))
+                if (writeResult != PipeResult::Pending && writeResult != PipeResult::Success)
                 {
                     MarkFailed(__LINE__);
                     return false;
                 }
-                phase = WirePhase::StopSent;
-                continue;
+            }
+
+            if (!readerActive)
+            {
+                const PipeResult beginResult = reader.Begin(m_pipe.get(), c_partialFrameTimeoutMs);
+                if (beginResult != PipeResult::Pending)
+                {
+                    MarkFailed(__LINE__);
+                    return false;
+                }
+                readerActive = true;
             }
 
             Message incoming{};
-            const PeekResult peek = PeekCompleteMessage(incoming, partialFrameStart);
-            if (peek == PeekResult::Disconnected || peek == PeekResult::InvalidFrame)
+            const PipeResult readResult = reader.Advance(incoming);
+            if (readResult == PipeResult::Success)
             {
-                MarkFailed(__LINE__);
-                return false;
-            }
-            if (peek == PeekResult::CompleteMessage)
-            {
+                readerActive = false;
+                recordInbound(incoming);
                 if (!HandleInbound(incoming, phase, activeEpoch, activeGeneration, lastInboundSequence))
                 {
                     MarkFailed(__LINE__);
@@ -1433,15 +1634,174 @@ private:
                 {
                     return true;
                 }
+                // A newly arrived frame may coincide with Stop or Shutdown.
+                // Refresh desired state and let the control transition run
+                // before waiting for another worker frame.
+                {
+                    auto stateLock = m_stateLock.lock_shared();
+                    if (m_terminalFailure)
+                    {
+                        return false;
+                    }
+                    shuttingDown = m_shutdownRequested;
+                    desiredRunning = m_desiredRunning;
+                    desiredEpoch = m_desiredEpoch;
+                    desiredGeneration = m_desiredGeneration;
+                }
+            }
+            else if (readResult != PipeResult::Pending)
+            {
+                MarkFailed(__LINE__);
+                return false;
+            }
+
+            if (!writerActive && shuttingDown && phase == WirePhase::Idle)
+            {
+                if (!beginControlWrite(ControlAction::Shutdown, MessageType::Shutdown, 0U, 0U))
+                {
+                    MarkFailed(__LINE__);
+                    return false;
+                }
+                continue;
+            }
+            if (!writerActive && !shuttingDown && phase == WirePhase::Idle && desiredRunning)
+            {
+                if (!beginControlWrite(ControlAction::Start, MessageType::Start, desiredEpoch, desiredGeneration))
+                {
+                    MarkFailed(__LINE__);
+                    return false;
+                }
+                continue;
+            }
+            if ((phase == WirePhase::Capturing || phase == WirePhase::StartSent) && (!desiredRunning || desiredEpoch != activeEpoch))
+            {
+                // A Start already accepted by the worker must be acknowledged
+                // before its exact epoch can be stopped.
+                if (phase == WirePhase::Capturing && !writerActive)
+                {
+                    if (!beginControlWrite(ControlAction::Stop, MessageType::Stop, activeEpoch, 0U))
+                    {
+                        MarkFailed(__LINE__);
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            if (shuttingDown && phase == WirePhase::Capturing && !writerActive)
+            {
+                if (!beginControlWrite(ControlAction::Stop, MessageType::Stop, activeEpoch, 0U))
+                {
+                    MarkFailed(__LINE__);
+                    return false;
+                }
                 continue;
             }
 
-            if (phase == WirePhase::ShutdownSent && shuttingDown)
+            if (!readerActive)
             {
-                // Shutdown/Closed has its own two-second deadline.
+                const PipeResult beginResult = reader.Begin(m_pipe.get(), c_partialFrameTimeoutMs);
+                if (beginResult != PipeResult::Pending)
+                {
+                    if (m_process && WaitForSingleObject(m_process.get(), 0U) == WAIT_OBJECT_0)
+                    {
+                        continue;
+                    }
+                    MarkFailed(__LINE__);
+                    return false;
+                }
+                readerActive = true;
             }
-            const DWORD waitResult = WaitForSingleObject(m_wakeEvent.get(), c_controllerCadenceMs);
-            if (waitResult == WAIT_FAILED)
+
+            HANDLE waitHandles[4]{};
+            DWORD handleCount = 0U;
+            DWORD processIndex = MAXDWORD;
+            DWORD stateIndex = MAXDWORD;
+            DWORD readerIndex = MAXDWORD;
+            DWORD writerIndex = MAXDWORD;
+            if (m_process)
+            {
+                processIndex = handleCount;
+                waitHandles[handleCount++] = m_process.get();
+            }
+            stateIndex = handleCount;
+            waitHandles[handleCount++] = m_wakeEvent.get();
+            if (readerActive && reader.Event() != nullptr)
+            {
+                readerIndex = handleCount;
+                waitHandles[handleCount++] = reader.Event();
+            }
+            if (writerActive && writer.Event() != nullptr)
+            {
+                writerIndex = handleCount;
+                waitHandles[handleCount++] = writer.Event();
+            }
+
+            DWORD timeoutMs = INFINITE;
+            const auto includeTimeout = [&](DWORD candidate) noexcept {
+                timeoutMs = (std::min)(timeoutMs, candidate);
+            };
+            if (readerActive)
+            {
+                includeTimeout(reader.WaitTimeoutMilliseconds());
+            }
+            if (writerActive)
+            {
+                includeTimeout(writer.WaitTimeoutMilliseconds());
+            }
+            const bool sessionCheckRelevant = phase == WirePhase::StartSent || phase == WirePhase::Capturing || phase == WirePhase::StopSent;
+            if (sessionCheckRelevant && nextSessionCheck != std::chrono::steady_clock::time_point{})
+            {
+                includeTimeout(RemainingMilliseconds(nextSessionCheck, now));
+            }
+            {
+                auto stateLock = m_stateLock.lock_shared();
+                const bool startDeadlineRelevant =
+                    (writerActive && pendingAction == ControlAction::Start) ||
+                    (m_desiredRunning &&
+                     (phase == WirePhase::Idle || phase == WirePhase::StartSent ||
+                      (phase == WirePhase::Capturing && m_readiness == SourceReadiness::Pending)));
+                if (startDeadlineRelevant)
+                {
+                    includeTimeout(RemainingMilliseconds(m_startDeadline, now));
+                }
+                if (m_controllerStopDeadline)
+                {
+                    includeTimeout(RemainingMilliseconds(*m_controllerStopDeadline, now));
+                }
+                if (phase == WirePhase::ShutdownSent)
+                {
+                    includeTimeout(RemainingMilliseconds(m_shutdownDeadline, now));
+                }
+            }
+
+            const DWORD waitResult = WaitForMultipleObjects(handleCount, waitHandles, FALSE, timeoutMs);
+            if (waitResult == WAIT_FAILED || (waitResult >= WAIT_ABANDONED_0 && waitResult < WAIT_ABANDONED_0 + handleCount))
+            {
+                MarkFailed(__LINE__);
+                return false;
+            }
+            if (waitResult == WAIT_TIMEOUT)
+            {
+                continue;
+            }
+            const DWORD signaledIndex = waitResult - WAIT_OBJECT_0;
+            if (signaledIndex == processIndex)
+            {
+                continue;
+            }
+            if (signaledIndex == stateIndex)
+            {
+                AddSaturating(metrics.stateWakes, 1U);
+            }
+            else if (signaledIndex == readerIndex)
+            {
+                AddSaturating(metrics.readerWakes, 1U);
+            }
+            else if (signaledIndex == writerIndex)
+            {
+                AddSaturating(metrics.writerWakes, 1U);
+            }
+            else
             {
                 MarkFailed(__LINE__);
                 return false;
@@ -1452,6 +1812,7 @@ private:
     mutable wil::srwlock m_stateLock;
     wil::srwlock m_shutdownLock;
     wsl::virtio_sound::native::S16LePcmRingSource m_ring;
+    std::shared_ptr<CaptureWakeSignal> m_wakeSignal;
     wil::unique_handle m_token;
     wil::unique_hfile m_pipe;
     wil::unique_handle m_job;
@@ -1480,6 +1841,7 @@ private:
     _Guarded_by_(m_stateLock) std::uint64_t m_wireGeneration {};
     _Guarded_by_(m_stateLock) std::uint32_t m_desiredPeriodFrames {};
     _Guarded_by_(m_stateLock) detail::CaptureStopDeadline m_stopDeadline;
+    _Guarded_by_(m_stateLock) std::optional<std::chrono::steady_clock::time_point> m_controllerStopDeadline;
     _Guarded_by_(m_stateLock) std::chrono::steady_clock::time_point m_startDeadline {};
     _Guarded_by_(m_stateLock) std::chrono::steady_clock::time_point m_shutdownDeadline {};
     std::uint64_t m_lastInboundSequence{};
@@ -1490,9 +1852,13 @@ WindowsCaptureSource::WindowsCaptureSource(std::unique_ptr<Impl> implementation)
 {
 }
 
-std::shared_ptr<WindowsCaptureSource> WindowsCaptureSource::Create(HANDLE restrictedUserToken, const std::wstring& workerPath, const std::wstring& endpointId)
+std::shared_ptr<WindowsCaptureSource> WindowsCaptureSource::Create(
+    HANDLE restrictedUserToken,
+    const std::wstring& workerPath,
+    const std::wstring& endpointId,
+    std::shared_ptr<CaptureWakeSignal> wakeSignal)
 {
-    auto implementation = std::make_unique<Impl>(c_captureRingFrames);
+    auto implementation = std::make_unique<Impl>(c_captureRingFrames, std::move(wakeSignal));
     try
     {
         implementation->Initialize(restrictedUserToken, workerPath, endpointId);

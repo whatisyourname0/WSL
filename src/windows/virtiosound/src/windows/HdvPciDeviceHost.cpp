@@ -427,12 +427,14 @@ public:
         CopyFault
     };
 
-    BackendState(HCS_SYSTEM system, const GUID& classId, const GUID& instanceId, std::shared_ptr<PcmSource> source, HostOwnership hostOwnership) :
+    BackendState(HCS_SYSTEM system, const GUID& classId, const GUID& instanceId, std::shared_ptr<PcmSource> source, HostOwnership hostOwnership,
+        std::shared_ptr<CaptureWakeSignal> wake) :
         m_borrowedSystem(system),
         m_deviceClassId(classId),
         m_deviceInstanceId(instanceId),
         m_ownership(hostOwnership),
-        m_pcmSource(std::move(source))
+        m_pcmSource(std::move(source)),
+        m_wake(std::move(wake))
     {
         m_guestMemoryApertures.reserve(c_maxApertureEntries);
         m_retainedGuestMemoryApertures.reserve(c_maxApertureEntries);
@@ -500,6 +502,7 @@ public:
     GUID m_deviceInstanceId{};
     HostOwnership m_ownership{HostOwnership::UnknownOrShared};
     std::shared_ptr<PcmSource> m_pcmSource;
+    std::shared_ptr<CaptureWakeSignal> m_wake;
     std::unique_ptr<VirtioSoundDevice> m_device;
     HDV_PCI_DEVICE_INTERFACE m_interface{};
     HDV_HOST m_deviceHost{};
@@ -1049,6 +1052,10 @@ public:
             }
             state.m_started = true;
             state.m_lastHostError.store(S_OK, std::memory_order_relaxed);
+            if (state.m_wake)
+            {
+                state.m_wake->Notify(CaptureWakeReason::GuestState);
+            }
             return S_OK;
         });
     }
@@ -1075,6 +1082,10 @@ public:
     {
         return Guard(context, [offset, value](BackendState& state) {
             state.m_device->WriteConfig(offset, value, 4);
+            if (state.m_wake)
+            {
+                state.m_wake->Notify(CaptureWakeReason::GuestState);
+            }
             return S_OK;
         });
     }
@@ -1099,6 +1110,10 @@ public:
         }
         return Guard(context, [offset, length, value](BackendState& state) {
             state.m_device->WriteBar(offset, value, static_cast<std::size_t>(length));
+            if (state.m_wake)
+            {
+                state.m_wake->Notify(offset == 0x30c ? CaptureWakeReason::GuestQueue : CaptureWakeReason::GuestState);
+            }
             return S_OK;
         });
     }
@@ -1116,6 +1131,10 @@ public:
             state->m_device->Reset();
             std::lock_guard<std::mutex> lock(state->m_lifecycleMutex);
             state->m_started = false;
+            if (state->m_wake)
+            {
+                state->m_wake->Notify(CaptureWakeReason::GuestState);
+            }
         }
         catch (...)
         {
@@ -1131,7 +1150,8 @@ HdvPciDeviceHost::HdvPciDeviceHost(std::shared_ptr<BackendState> state) noexcept
 HdvPciDeviceHost::~HdvPciDeviceHost() = default;
 
 std::unique_ptr<HdvPciDeviceHost> HdvPciDeviceHost::CreateBorrowed(
-    HCS_SYSTEM borrowedSystem, const GUID& deviceClassId, const GUID& deviceInstanceId, std::shared_ptr<PcmSource> source, HostOwnership ownership)
+    HCS_SYSTEM borrowedSystem, const GUID& deviceClassId, const GUID& deviceInstanceId, std::shared_ptr<PcmSource> source,
+    HostOwnership ownership, std::shared_ptr<CaptureWakeSignal> wake)
 {
     if (borrowedSystem == nullptr)
     {
@@ -1143,7 +1163,7 @@ std::unique_ptr<HdvPciDeviceHost> HdvPciDeviceHost::CreateBorrowed(
     }
 
     const HdvApi& api = LoadApi();
-    auto state = std::make_shared<BackendState>(borrowedSystem, deviceClassId, deviceInstanceId, std::move(source), ownership);
+    auto state = std::make_shared<BackendState>(borrowedSystem, deviceClassId, deviceInstanceId, std::move(source), ownership, std::move(wake));
     HRESULT hr = api.m_initialize(borrowedSystem, &state->m_deviceHost);
     state->m_creationResult.store(hr, std::memory_order_relaxed);
     if (hr < 0)
@@ -1347,6 +1367,38 @@ int HdvPciDeviceHost::PumpCaptureElapsed(std::uint64_t elapsedNanoseconds) noexc
         m_state->m_lastHostError.store(E_FAIL, std::memory_order_relaxed);
         return 0;
     }
+}
+
+CaptureServiceResult HdvPciDeviceHost::ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer) noexcept
+{
+    CaptureServiceResult result;
+    if (!m_state)
+    {
+        return result;
+    }
+    BackendState::Operation operation(m_state.get(), true);
+    if (!operation)
+    {
+        return result;
+    }
+    try
+    {
+        BackendState::ApertureBatch apertureBatch(*m_state);
+#if defined(WSL_VIRTIO_SOUND_ADAPTER_TESTING)
+        NotifyAperturePumpTestHook(m_state.get());
+#endif
+        result = m_state->m_device->ServiceCapture(elapsedNanoseconds, allowTransfer);
+        if (!apertureBatch.Finish())
+        {
+            result.m_waitReason = CaptureWaitReason::Failed;
+        }
+    }
+    catch (...)
+    {
+        m_state->m_lastHostError.store(E_FAIL, std::memory_order_relaxed);
+        result.m_waitReason = CaptureWaitReason::Failed;
+    }
+    return result;
 }
 
 bool HdvPciDeviceHost::CaptureRunning() const noexcept

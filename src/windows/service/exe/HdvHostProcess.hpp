@@ -16,7 +16,7 @@
 #include <wil/resource.h>
 #include <wil/result.h>
 
-#include "CapturePumpScheduler.hpp"
+#include "CaptureEventScheduler.hpp"
 #include "HdvPciDeviceHost.hpp"
 #include "WindowsCaptureSource.hpp"
 #include "../../virtiosound/src/windows/AudioSourceTrace.hpp"
@@ -97,6 +97,7 @@ inline int Run(int argc, wchar_t** argv) noexcept
         using unique_hcs_system = wil::unique_any<HCS_SYSTEM, decltype(&HcsCloseComputeSystem), HcsCloseComputeSystem>;
         unique_hcs_system system;
         THROW_IF_FAILED(HcsOpenComputeSystem(argv[2], GENERIC_ALL, &system));
+        auto captureWake = std::make_shared<native::windows::CaptureWakeSignal>();
         std::shared_ptr<native::windows::WindowsCaptureSource> source;
         auto shutdownSource = wil::scope_exit([&] {
             if (source)
@@ -115,38 +116,33 @@ inline int Run(int argc, wchar_t** argv) noexcept
             const auto length = GetModuleFileNameW(nullptr, image, ARRAYSIZE(image));
             THROW_LAST_ERROR_IF(!length || length == ARRAYSIZE(image));
             const auto worker = std::filesystem::path(image).parent_path() / L"wsl-audio-worker.exe";
-            source = native::windows::WindowsCaptureSource::Create(userToken.get(), worker.wstring(), startup.m_endpoint);
+            source = native::windows::WindowsCaptureSource::Create(userToken.get(), worker.wstring(), startup.m_endpoint, captureWake);
         }
         constexpr GUID c_deviceClass{0xF1919B41, 0x6A33, 0x4C92, {0xA7, 0xF8, 0x39, 0x7E, 0xE4, 0xC5, 0xB1, 0xD2}};
         auto host = native::windows::HdvPciDeviceHost::CreateBorrowed(
-            system.get(), c_deviceClass, instance, source, native::windows::HostOwnership::UnknownOrShared);
+            system.get(), c_deviceClass, instance, source, native::windows::HostOwnership::UnknownOrShared, captureWake);
         packet.m_result = S_OK;
         DWORD written{};
         THROW_IF_WIN32_BOOL_FALSE(WriteFile(output.get(), &packet, sizeof(packet), &written, nullptr));
         THROW_HR_IF(E_FAIL, written != sizeof(packet));
         output.reset();
         using clock = std::chrono::steady_clock;
-        constexpr std::uint64_t c_nanosecondsPerMillisecond = 1'000'000;
-        constexpr std::uint64_t c_idlePumpIntervalNanoseconds =
-            static_cast<std::uint64_t>(native::VirtioSoundDevice::c_capturePumpIntervalMs) * c_nanosecondsPerMillisecond;
-        // Active capture uses half the legacy 10 ms compatibility interval to
-        // provide another service opportunity between 480-frame periods. Host
-        // scheduling jitter and long stalls can still increase source backlog.
-        constexpr std::uint64_t c_activePumpIntervalNanoseconds = c_idlePumpIntervalNanoseconds / 2;
         const auto clockOrigin = clock::now();
         auto lastPump = clockOrigin;
         auto toNanoseconds = [&](clock::time_point time) {
             return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(time - clockOrigin).count());
         };
-        detail::CapturePumpScheduler scheduler(c_idlePumpIntervalNanoseconds, 0);
-        const HANDLE waits[]{stop, parent};
+        detail::CaptureEventScheduler scheduler;
+        std::uint64_t eventWakes{}, deadlineWakes{}, emptyServices{}, deferredServices{}, completedFrames{};
+        std::uint64_t sourceWakes{}, guestWakes{}, serviceNanoseconds{}, maximumServiceNanoseconds{};
+        // A startup rescan covers state published before this loop began.
+        captureWake->Notify(native::windows::CaptureWakeReason::GuestState);
+        const HANDLE waits[]{stop, parent, captureWake->Event()};
         for (;;)
         {
             const auto beforeWait = clock::now();
             const auto beforeWaitNanoseconds = toNanoseconds(beforeWait);
-            scheduler.SetInterval(
-                host->CaptureRunning() ? c_activePumpIntervalNanoseconds : c_idlePumpIntervalNanoseconds, beforeWaitNanoseconds);
-            const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, scheduler.WaitTimeoutMilliseconds(beforeWaitNanoseconds));
+            const DWORD wait = WaitForMultipleObjects(3, waits, FALSE, scheduler.WaitTimeoutMilliseconds(beforeWaitNanoseconds));
             if (wait == WAIT_OBJECT_0)
             {
                 // The parent signals stop only after confirming guest shutdown.
@@ -170,25 +166,43 @@ inline int Run(int argc, wchar_t** argv) noexcept
                 // callback root pinned until this child process exits.
                 THROW_LAST_ERROR();
             }
-            if (wait != WAIT_TIMEOUT)
+            if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0 + 2)
             {
                 THROW_HR(E_UNEXPECTED);
             }
 
             const auto pumpStarted = clock::now();
             const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(pumpStarted - lastPump).count();
-            // Keep elapsed time measured across state changes. PumpCaptureElapsed
-            // owns START/STOP generation handling and discards stale credit.
+            // State events never grant sample credit. Always service readiness
+            // and failures, even when the completion-rate deadline is not due.
             lastPump = pumpStarted;
-            scheduler.PumpStarted(toNanoseconds(pumpStarted));
-            if (elapsed > 0)
+            const auto reasons = captureWake->Consume();
+            if (wait == WAIT_TIMEOUT)
             {
-                host->PumpCaptureElapsed(static_cast<std::uint64_t>(elapsed));
+                ++deadlineWakes;
             }
-            scheduler.PumpCompleted(toNanoseconds(clock::now()));
+            else
+            {
+                ++eventWakes;
+            }
+            sourceWakes += (reasons & 3U) != 0;
+            guestWakes += (reasons & 12U) != 0;
+            const auto startedAt = toNanoseconds(pumpStarted);
+            const bool allowTransfer = scheduler.CanTransfer(startedAt, host->CapturePacingGeneration());
+            const auto result = host->ServiceCapture(elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0, allowTransfer);
+            scheduler.OnService(startedAt, result);
+            const auto duration = toNanoseconds(clock::now()) - startedAt;
+            serviceNanoseconds += duration;
+            maximumServiceNanoseconds = (std::max)(maximumServiceNanoseconds, duration);
+            emptyServices += result.m_frames == 0;
+            deferredServices += result.m_waitReason == native::CaptureWaitReason::PacingDeadline;
+            completedFrames += static_cast<std::uint64_t>((std::max)(0, result.m_frames));
         }
-        native::windows::detail::TraceAudioSource(
-            L"CapturePumpSchedule", scheduler.LateTicks(), scheduler.SkippedDeadlines());
+        native::windows::detail::TraceAudioSource(L"CaptureWakeTotals", eventWakes, deadlineWakes);
+        native::windows::detail::TraceAudioSource(L"CaptureWakeReasons", sourceWakes, guestWakes);
+        native::windows::detail::TraceAudioSource(L"CaptureServiceEmpty", emptyServices, deferredServices);
+        native::windows::detail::TraceAudioSource(L"CaptureServiceTime", serviceNanoseconds, maximumServiceNanoseconds);
+        native::windows::detail::TraceAudioSource(L"CaptureServiceFrames", completedFrames);
         // The parent confirms guest shutdown before signaling stop. Keep the
         // existing ownership rule: do not tear down another WSL proxy registration.
         (void)host->GuestStoppedAndRetire();

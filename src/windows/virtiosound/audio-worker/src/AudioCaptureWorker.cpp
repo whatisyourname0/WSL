@@ -20,7 +20,7 @@
 namespace wsl::virtio_sound::audio_worker {
 namespace {
 
-    constexpr auto c_capturePollInterval = std::chrono::milliseconds(20);
+    constexpr auto c_captureWaitTimeout = std::chrono::milliseconds::max();
 
     CaptureError MakeError(CaptureErrorCode code, const wchar_t* message)
     {
@@ -64,13 +64,29 @@ namespace {
                 throw std::invalid_argument("PCM queue capacity is invalid or too large.");
             }
             m_storage.resize(m_capacityFrames * RequiredBytesPerFrame());
+#ifdef _WIN32
+            m_activityEvent.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+            if (!m_activityEvent)
+            {
+                throw std::runtime_error("Could not create the capture activity event.");
+            }
+#endif
         }
 
-        void Reset() noexcept
+        void Reset(bool resetTerminalState = false) noexcept
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_headFrame = 0;
             m_queuedFrames = 0;
+            if (resetTerminalState)
+            {
+                m_terminalActivity = false;
+                ResetActivityLocked();
+            }
+            else if (!m_terminalActivity)
+            {
+                ResetActivityLocked();
+            }
         }
 
         QueueWriteResult TryWrite(const CapturePacket& packet) noexcept
@@ -97,6 +113,7 @@ namespace {
             CopyIntoRing(writeFrame, packet.m_s16LeBytes.data(), packet.m_frames);
             m_queuedFrames += packet.m_frames;
             m_framesWritten += packet.m_frames;
+            SignalActivityLocked();
             return QueueWriteResult::Written;
         }
 
@@ -106,6 +123,26 @@ namespace {
             ++m_discontinuities;
             m_headFrame = 0;
             m_queuedFrames = 0;
+            if (!m_terminalActivity)
+            {
+                ResetActivityLocked();
+            }
+        }
+
+        void SignalTerminalState() noexcept
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_terminalActivity = true;
+            SignalActivityLocked();
+        }
+
+        void* ActivityWaitHandle() const noexcept
+        {
+#ifdef _WIN32
+            return m_activityEvent.get();
+#else
+            return nullptr;
+#endif
         }
 
         std::size_t Read(std::uint8_t* destination, std::size_t requestedFrames, std::size_t destinationByteCount) noexcept
@@ -130,6 +167,10 @@ namespace {
             m_headFrame = (m_headFrame + framesToRead) % m_capacityFrames;
             m_queuedFrames -= framesToRead;
             m_framesRead += framesToRead;
+            if (m_queuedFrames == 0 && !m_terminalActivity)
+            {
+                ResetActivityLocked();
+            }
             return framesToRead;
         }
 
@@ -144,10 +185,32 @@ namespace {
             snapshot.m_overflowFramesDropped = m_overflowFramesDropped;
             snapshot.m_discontinuities = m_discontinuities;
             snapshot.m_invalidReads = m_invalidReads;
+            snapshot.m_activitySignals = m_activitySignals;
             return snapshot;
         }
 
     private:
+        void SignalActivityLocked() noexcept
+        {
+            ++m_activitySignals;
+#ifdef _WIN32
+            if (m_activityEvent)
+            {
+                (void)SetEvent(m_activityEvent.get());
+            }
+#endif
+        }
+
+        void ResetActivityLocked() noexcept
+        {
+#ifdef _WIN32
+            if (m_activityEvent)
+            {
+                (void)ResetEvent(m_activityEvent.get());
+            }
+#endif
+        }
+
         std::size_t RecordInvalidRead() noexcept
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -188,6 +251,11 @@ namespace {
         std::uint64_t m_overflowFramesDropped{};
         std::uint64_t m_discontinuities{};
         std::uint64_t m_invalidReads{};
+        std::uint64_t m_activitySignals{};
+        bool m_terminalActivity{};
+#ifdef _WIN32
+        wil::unique_event m_activityEvent;
+#endif
     };
 
 } // namespace
@@ -212,6 +280,13 @@ public:
         {
             throw std::invalid_argument("Capture startup timeout must be positive.");
         }
+#ifdef _WIN32
+        m_stopEvent.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        if (!m_stopEvent)
+        {
+            throw std::runtime_error("Could not create the capture stop event.");
+        }
+#endif
     }
 
     ~Impl()
@@ -242,8 +317,11 @@ public:
             return false;
         }
 
-        m_queue.Reset();
+        m_queue.Reset(true);
         m_stopRequested.store(false, std::memory_order_release);
+#ifdef _WIN32
+        (void)ResetEvent(m_stopEvent.get());
+#endif
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             m_state = WorkerState::Starting;
@@ -270,6 +348,9 @@ public:
             m_lastError = error;
             m_state = WorkerState::Stopping;
             m_stopRequested.store(true, std::memory_order_release);
+#ifdef _WIN32
+            (void)SetEvent(m_stopEvent.get());
+#endif
             stateLock.unlock();
             m_worker.join();
             m_queue.Reset();
@@ -314,6 +395,9 @@ public:
         }
 
         m_stopRequested.store(true, std::memory_order_release);
+#ifdef _WIN32
+        (void)SetEvent(m_stopEvent.get());
+#endif
         {
             std::lock_guard<std::mutex> stateLock(m_stateMutex);
             if (m_state == WorkerState::Running || m_state == WorkerState::Starting)
@@ -340,6 +424,11 @@ public:
     std::size_t ReadFrames(std::uint8_t* destination, std::size_t requestedFrames, std::size_t destinationByteCount) noexcept
     {
         return m_queue.Read(destination, requestedFrames, destinationByteCount);
+    }
+
+    void* ActivityWaitHandle() const noexcept
+    {
+        return m_queue.ActivityWaitHandle();
     }
 
     WorkerSnapshot Snapshot() const
@@ -384,11 +473,13 @@ private:
     void Fail(CaptureError error, CaptureErrorCode fallback, const wchar_t* message)
     {
         error = NormalizeError(std::move(error), fallback, message);
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        m_lastError = std::move(error);
-        m_state = WorkerState::Failed;
-        m_startupComplete = true;
-        m_startupCondition.notify_all();
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            m_lastError = std::move(error);
+            m_state = WorkerState::Failed;
+            m_startupComplete = true;
+            m_startupCondition.notify_all();
+        }
     }
 
     void WorkerMain(const std::wstring& endpointId) noexcept
@@ -454,7 +545,16 @@ private:
                         {
                             CapturePacket packet;
                             workerError = {};
-                            const auto result = device->ReadPacket(c_capturePollInterval, m_stopRequested, packet, workerError);
+                            const auto result = device->ReadPacketInterruptible(
+                                c_captureWaitTimeout,
+                                m_stopRequested,
+#ifdef _WIN32
+                                reinterpret_cast<std::uintptr_t>(m_stopEvent.get()),
+#else
+                                0U,
+#endif
+                                packet,
+                                workerError);
                             if (result == CaptureReadResult::Packet && !firstPacketLogged)
                             {
                                 detail::TraceAudioWorker(L"FirstPacket", packet.m_rawFlags, packet.m_frames);
@@ -573,21 +673,27 @@ private:
             }
         }
 
-        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        {
+            std::lock_guard<std::mutex> stateLock(m_stateMutex);
+            if (failed)
+            {
+                if (m_lastError.m_code == CaptureErrorCode::None)
+                {
+                    m_lastError = workerError;
+                }
+                m_state = WorkerState::Failed;
+            }
+            else
+            {
+                m_state = WorkerState::Stopped;
+            }
+            m_startupComplete = true;
+            m_startupCondition.notify_all();
+        }
         if (failed)
         {
-            if (m_lastError.m_code == CaptureErrorCode::None)
-            {
-                m_lastError = workerError;
-            }
-            m_state = WorkerState::Failed;
+            m_queue.SignalTerminalState();
         }
-        else
-        {
-            m_state = WorkerState::Stopped;
-        }
-        m_startupComplete = true;
-        m_startupCondition.notify_all();
     }
 
     std::unique_ptr<ICaptureDeviceFactory> m_factory;
@@ -599,6 +705,9 @@ private:
     std::condition_variable m_startupCondition;
     std::mutex m_controlMutex;
     std::thread m_worker;
+#ifdef _WIN32
+    wil::unique_event m_stopEvent;
+#endif
     WorkerState m_state{WorkerState::Stopped};
     CaptureError m_lastError{};
     bool m_startupComplete{};
@@ -624,6 +733,11 @@ bool AudioCaptureWorker::Stop(CaptureError& error)
 std::size_t AudioCaptureWorker::ReadFrames(std::uint8_t* destination, std::size_t requestedFrames, std::size_t destinationByteCount) noexcept
 {
     return m_impl->ReadFrames(destination, requestedFrames, destinationByteCount);
+}
+
+void* AudioCaptureWorker::ActivityWaitHandle() const noexcept
+{
+    return m_impl->ActivityWaitHandle();
 }
 
 WorkerSnapshot AudioCaptureWorker::Snapshot() const

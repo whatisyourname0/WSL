@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "VirtioSoundDevice.hpp"
+#include "CaptureWakeSignal.hpp"
 
 namespace wsl::virtio_sound::native::windows {
 
@@ -43,7 +44,8 @@ public:
         const GUID& deviceClassId,
         const GUID& deviceInstanceId,
         std::shared_ptr<PcmSource> source = {},
-        HostOwnership ownership = HostOwnership::UnknownOrShared);
+        HostOwnership ownership = HostOwnership::UnknownOrShared,
+        std::shared_ptr<CaptureWakeSignal> wake = {});
 
     ~HdvPciDeviceHost();
     HdvPciDeviceHost(const HdvPciDeviceHost&) = delete;
@@ -56,6 +58,7 @@ public:
     RetireOutcome GuestStoppedAndRetire() noexcept;
     int PumpCapture(int frameBudget) noexcept;
     int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds) noexcept;
+    CaptureServiceResult ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer) noexcept;
     bool CaptureRunning() const noexcept;
     std::uint32_t CapturePeriodFrames() const noexcept;
     std::uint32_t MaximumCaptureFrameBudget() const noexcept;

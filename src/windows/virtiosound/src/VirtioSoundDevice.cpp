@@ -47,7 +47,6 @@ namespace {
     constexpr std::uint32_t c_pcmFeatureXruns = 1U << 4;
     constexpr std::uint32_t c_supportedPcmFeatures = c_pcmFeatureXruns;
     constexpr std::uint64_t c_deviceFeatures = 1ULL << 32;     // VIRTIO_F_VERSION_1
-    constexpr std::uint16_t c_virtqUsedFlagNoNotify = 1;       // VIRTQ_USED_F_NO_NOTIFY; EVENT_IDX is not advertised
     constexpr std::uint64_t c_supportedFormatMask = 1ULL << 5; // S16_LE
     constexpr std::uint32_t c_maxPcmPayloadBytes = 1024 * 1024 - 12;
 
@@ -470,15 +469,16 @@ public:
                 }
                 else
                 {
-                    // RX is consumed by PumpCapture, not by queue kicks. Advise the
-                    // driver that it need not synchronously notify us after adding
-                    // RX buffers. Publish this device-owned used-ring metadata only
+                    // RX kicks wake the owning loop but never transfer PCM inside
+                    // this callback. Keep notifications enabled so reposted buffers
+                    // can wake a source that has data but is waiting for RX. Publish
+                    // this device-owned used-ring metadata only
                     // after validating the queue, and do not expose an enabled RX
                     // queue if guest memory rejects the write.
                     if (queue == &m_queues[3])
                     {
                         std::array<std::uint8_t, 2> flags{};
-                        WriteLe(flags.data(), 0, c_virtqUsedFlagNoNotify, flags.size());
+                        WriteLe(flags.data(), 0, 0, flags.size());
                         try
                         {
                             WriteGuest(queue->m_usedRing, flags.data(), flags.size());
@@ -1329,7 +1329,8 @@ public:
         return frames;
     }
 
-    int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds)
+    int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds, bool allowTransfer = true,
+        std::uint32_t frameLimit = (std::numeric_limits<std::uint32_t>::max)())
     {
         std::lock_guard<std::recursive_mutex> lock(m_gate);
         Increment(m_captureElapsedPumpCalls);
@@ -1398,6 +1399,10 @@ public:
                 // Never add wall-clock credit to it, and let its first ready
                 // buffer through even on the first tick after START.
                 m_elapsedFrameCredit = 0;
+                if (!allowTransfer)
+                {
+                    return 0;
+                }
                 const std::uint32_t maximumFrames = VirtioSoundDevice::c_maxTransferBytes / m_frameBytes;
                 std::uint32_t maximumBurstFrames = maximumFrames;
                 const std::uint32_t bufferFrames = m_bufferBytes / m_frameBytes;
@@ -1410,7 +1415,7 @@ public:
                     maximumBurstFrames = (std::min)(maximumBurstFrames, bufferFrames - periodFrames);
                 }
                 const std::uint32_t availableBudget = (std::min)(*availableFrames, maximumBurstFrames);
-                return PumpCapture(static_cast<int>(availableBudget));
+                return PumpCapture(static_cast<int>((std::min)(availableBudget, frameLimit)));
             }
         }
 
@@ -1425,10 +1430,56 @@ public:
         const std::uint32_t maxFrames = VirtioSoundDevice::c_maxTransferBytes / m_frameBytes;
         long double added = static_cast<long double>(elapsedNanoseconds) * m_format.m_sampleRate / 1000000000.0L;
         m_elapsedFrameCredit = std::min(static_cast<long double>(maxFrames), m_elapsedFrameCredit + added);
-        int budget = static_cast<int>(std::min(m_elapsedFrameCredit, static_cast<long double>(maxFrames)));
+        if (!allowTransfer)
+        {
+            return 0;
+        }
+        int budget = static_cast<int>(std::min(m_elapsedFrameCredit, static_cast<long double>((std::min)(maxFrames, frameLimit))));
         int completed = PumpCapture(budget);
         m_elapsedFrameCredit = std::max(0.0L, m_elapsedFrameCredit - completed);
         return completed;
+    }
+
+    CaptureServiceResult ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_gate);
+        CaptureServiceResult result;
+        result.m_frames = PumpCaptureElapsed(elapsedNanoseconds, allowTransfer, m_periodBytes / m_frameBytes);
+        result.m_generation = m_pacingGeneration;
+        result.m_periodFrames = m_periodBytes / m_frameBytes;
+        result.m_sampleRate = m_format.m_sampleRate;
+        const auto available = m_pcmSource ? m_pcmSource->AvailableFrames() : std::nullopt;
+        result.m_sourceClocked = available.has_value();
+        result.m_moreSourceFrames = available.has_value() && result.m_periodFrames != 0 && *available >= result.m_periodFrames;
+        if (!Ready() || !IsRunning())
+        {
+            result.m_waitReason = CaptureWaitReason::Idle;
+        }
+        else if (CurrentSourceReadiness() == SourceReadiness::Failed)
+        {
+            result.m_waitReason = CaptureWaitReason::Failed;
+        }
+        else if (CurrentSourceReadiness() == SourceReadiness::Pending)
+        {
+            result.m_waitReason = CaptureWaitReason::Readiness;
+        }
+        else if (result.m_frames != 0)
+        {
+            result.m_waitReason = CaptureWaitReason::Progress;
+        }
+        else if (!allowTransfer)
+        {
+            result.m_waitReason = CaptureWaitReason::PacingDeadline;
+        }
+        else if (available.has_value() && !result.m_moreSourceFrames)
+        {
+            result.m_waitReason = CaptureWaitReason::SourceData;
+        }
+        else
+        {
+            result.m_waitReason = CaptureWaitReason::RxBuffer;
+        }
+        return result;
     }
 
     bool CaptureRunning() const
@@ -1669,6 +1720,11 @@ int VirtioSoundDevice::PumpCapture(int frameBudget)
 int VirtioSoundDevice::PumpCaptureElapsed(std::uint64_t elapsedNanoseconds)
 {
     return m_impl->PumpCaptureElapsed(elapsedNanoseconds);
+}
+
+CaptureServiceResult VirtioSoundDevice::ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer)
+{
+    return m_impl->ServiceCapture(elapsedNanoseconds, allowTransfer);
 }
 bool VirtioSoundDevice::CaptureRunning() const noexcept
 {
