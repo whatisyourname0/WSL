@@ -473,7 +473,7 @@ PipeResult PipeMessageReader::Begin(HANDLE pipe, DWORD partialFrameTimeoutMs) no
     m_payloadBytesRead = 0U;
     m_payload.clear();
     m_wireHeader.fill(0U);
-    m_state = State::FirstByte;
+    m_state = State::Header;
 
     const PipeResult result = IssueRead();
     if (result != PipeResult::Pending)
@@ -490,10 +490,6 @@ PipeResult PipeMessageReader::IssueRead() noexcept
     std::size_t requested = 0U;
     switch (m_state)
     {
-    case State::FirstByte:
-        destination = m_wireHeader.data();
-        requested = 1U;
-        break;
     case State::Header:
         destination = m_wireHeader.data() + m_headerBytesRead;
         requested = c_headerBytes - m_headerBytesRead;
@@ -559,20 +555,14 @@ PipeResult PipeMessageReader::CompleteRead(DWORD transferred) noexcept
         return Finish(PipeResult::IoError);
     }
 
-    if (m_state == State::FirstByte)
-    {
-        if (transferred != 1U)
-        {
-            return Finish(PipeResult::IoError);
-        }
-        m_headerBytesRead = 1U;
-        m_deadline = GetTickCount64() + static_cast<ULONGLONG>(m_partialFrameTimeoutMs);
-        m_deadlineArmed = true;
-        m_state = State::Header;
-    }
-    else if (m_state == State::Header)
+    if (m_state == State::Header)
     {
         m_headerBytesRead += transferred;
+        if (!m_deadlineArmed)
+        {
+            m_deadline = GetTickCount64() + static_cast<ULONGLONG>(m_partialFrameTimeoutMs);
+            m_deadlineArmed = true;
+        }
         if (m_headerBytesRead == c_headerBytes)
         {
             Error codecError = Error::None;

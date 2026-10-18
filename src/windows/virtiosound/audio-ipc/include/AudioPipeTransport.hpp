@@ -33,18 +33,19 @@ enum class PipeResult
     Pending,
 };
 
-// Stateful overlapped reader for one message at a time. Begin starts a one-byte
-// header probe and returns Pending when the request has been issued. Advance is
-// nonblocking (apart from draining an expired/cancelled request) and is the only
-// method that reports a completed message. The first-byte probe has no deadline;
-// partialFrameTimeoutMs starts when its first byte arrives and covers the rest
-// of that frame. The pipe handle is borrowed and must remain valid until the
-// operation completes or CancelAndDrain returns. Advance reports a completed
-// message once. CancelAndDrain cancels, drains, and returns the reader to Idle;
-// discard that pipe because part of a frame may already have been read. A
-// timeout is also terminal for its pipe. Successful delivery reuses a bounded
-// prior output payload buffer on the next frame. Calls on an instance must be
-// serialized. A single read and one write may run concurrently on a pipe.
+// Stateful overlapped reader for one message at a time. Begin starts a read for
+// up to the full header and returns Pending when the request has been issued.
+// Advance is nonblocking (apart from draining an expired/cancelled request) and
+// is the only method that reports a completed message. The initial header read
+// has no deadline; partialFrameTimeoutMs starts when its first bytes arrive and
+// covers the rest of that frame. The pipe handle is borrowed and must remain
+// valid until the operation completes or CancelAndDrain returns. Advance
+// reports a completed message once. CancelAndDrain cancels, drains, and returns
+// the reader to Idle; discard that pipe because part of a frame may already
+// have been read. A timeout is also terminal for its pipe. Successful delivery
+// reuses a bounded prior output payload buffer on the next frame. Calls on an
+// instance must be serialized. A single read and one write may run concurrently
+// on a pipe.
 class PipeMessageReader final
 {
 public:
@@ -66,7 +67,6 @@ private:
     enum class State : std::uint8_t
     {
         Idle,
-        FirstByte,
         Header,
         Payload,
         Finished,

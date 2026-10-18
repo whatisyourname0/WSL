@@ -260,6 +260,14 @@ bool Encode(const Message& message, std::vector<std::uint8_t>& wire)
     return true;
 }
 
+bool MessageMatches(const Message& actual, const Message& expected)
+{
+    return actual.m_header.m_magic == expected.m_header.m_magic && actual.m_header.m_version == expected.m_header.m_version &&
+           actual.m_header.m_type == expected.m_header.m_type && actual.m_header.m_payloadBytes == expected.m_header.m_payloadBytes &&
+           actual.m_header.m_reserved == expected.m_header.m_reserved && actual.m_header.m_epoch == expected.m_header.m_epoch &&
+           actual.m_header.m_sequence == expected.m_header.m_sequence && actual.m_payload == expected.m_payload;
+}
+
 PipeResult AwaitReader(PipeMessageReader& reader, Message& out, DWORD timeoutMs)
 {
     const ULONGLONG deadline = GetTickCount64() + timeoutMs;
@@ -325,7 +333,7 @@ void TestIdleReaderPartialTimeoutAndRecovery()
     }
 
     PipeMessageReader reader;
-    if (!Check(reader.Begin(server.Get(), 120U) == PipeResult::Pending, "reader starts the one-byte probe"))
+    if (!Check(reader.Begin(server.Get(), 120U) == PipeResult::Pending, "reader starts its header read"))
     {
         return;
     }
@@ -341,16 +349,18 @@ void TestIdleReaderPartialTimeoutAndRecovery()
     {
         return;
     }
-    const std::size_t partialHeaderBytes = 5U;
+    const std::size_t partialHeaderBytes = 1U;
     std::vector<std::uint8_t> prefix(wire.begin(), wire.begin() + static_cast<std::ptrdiff_t>(partialHeaderBytes));
-    if (!Check(WriteAll(client.Get(), prefix), "partial header reaches the reader") ||
-        !Check(WaitForSingleObject(reader.Event(), 1000U) == WAIT_OBJECT_0, "first frame byte completes the probe") ||
-        !Check(reader.Advance(out) == PipeResult::Pending, "partial frame remains pending"))
+    if (!Check(WriteAll(client.Get(), prefix), "exactly one header byte reaches the reader") ||
+        !Check(
+            WaitForSingleObject(reader.Event(), 1000U) == WAIT_OBJECT_0,
+            "one available header byte completes the pending read promptly") ||
+        !Check(reader.Advance(out) == PipeResult::Pending, "one-byte partial header remains pending"))
     {
         reader.CancelAndDrain();
         return;
     }
-    Check(reader.WaitTimeoutMilliseconds() <= 120U, "partial frame has a bounded remaining deadline");
+    Check(reader.WaitTimeoutMilliseconds() <= 120U, "one-byte partial header arms a finite frame deadline");
     Sleep(180U);
     if (!Check(reader.Advance(out) == PipeResult::Timeout, "partial frame expires and drains its outstanding read"))
     {
@@ -409,10 +419,24 @@ void TestInvalidHeaderBeforePayloadAndOutPreservation()
     invalidWire[11U] = static_cast<std::uint8_t>(((c_maxPayloadBytes + 1U) >> 24U) & 0xFFU);
     invalidWire.resize(c_headerBytes);
 
+    // Put additional bytes immediately behind the malformed header. The reader
+    // must reject the header without consuming any of those bytes.
+    const Message nextFrame = MakeMessage(MessageType::Hello, 13U);
+    std::vector<std::uint8_t> nextFrameWire;
+    if (!Check(Encode(nextFrame, nextFrameWire), "following frame encodes for malformed-header boundary test"))
+    {
+        return;
+    }
+    std::vector<std::uint8_t> trailingBytes{0xA1U, 0xB2U, 0xC3U, 0xD4U};
+    trailingBytes.insert(trailingBytes.end(), nextFrameWire.begin(), nextFrameWire.end());
+    std::vector<std::uint8_t> invalidStream = invalidWire;
+    invalidStream.insert(invalidStream.end(), trailingBytes.begin(), trailingBytes.end());
+
     PipeMessageReader reader;
-    Message out = MakeMessage(MessageType::Hello, 99U);
+    Message out = MakePcmMessage(99U, 32U, 0x19U);
+    const Message unchanged = out;
     if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader starts before invalid header arrives") ||
-        !Check(WriteAll(client.Get(), invalidWire), "oversized header reaches reader without a payload"))
+        !Check(WriteAll(client.Get(), invalidStream), "oversized header and following bytes reach reader together"))
     {
         reader.CancelAndDrain();
         return;
@@ -422,7 +446,163 @@ void TestInvalidHeaderBeforePayloadAndOutPreservation()
         reader.CancelAndDrain();
         return;
     }
-    Check(out.m_header.m_sequence == 99U, "failed read leaves the caller message unchanged");
+    Check(MessageMatches(out, unchanged), "invalid header leaves the caller message unchanged");
+
+    std::vector<std::uint8_t> peekedBytes(trailingBytes.size());
+    DWORD bytesRead = 0U;
+    DWORD bytesAvailable = 0U;
+    if (!Check(
+            PeekNamedPipe(server.Get(), peekedBytes.data(), static_cast<DWORD>(peekedBytes.size()), &bytesRead, &bytesAvailable, nullptr) != FALSE,
+            "bytes after the malformed header remain available in the pipe"))
+    {
+        return;
+    }
+    Check(
+        bytesRead == trailingBytes.size() && bytesAvailable == trailingBytes.size() && peekedBytes == trailingBytes,
+        "malformed-header rejection consumes neither trailing bytes nor the next frame");
+}
+
+void TestPrequeuedPcmFramesRespectExactBoundary()
+{
+    OwnedHandle server;
+    OwnedHandle client;
+    Check(CreatePipePair(server, client), "pipe pair opens for prequeued frame boundary test");
+    if (!server || !client)
+    {
+        return;
+    }
+
+    const Message first = MakePcmMessage(14U, 192U, 0x2BU);
+    const Message second = MakePcmMessage(15U, 68U, 0x91U);
+    std::vector<std::uint8_t> firstWire;
+    std::vector<std::uint8_t> secondWire;
+    if (!Check(Encode(first, firstWire), "first prequeued PCM frame encodes") ||
+        !Check(Encode(second, secondWire), "second prequeued PCM frame encodes"))
+    {
+        return;
+    }
+
+    std::vector<std::uint8_t> prequeued = firstWire;
+    prequeued.insert(prequeued.end(), secondWire.begin(), secondWire.end());
+    if (!Check(WriteAll(client.Get(), prequeued), "two complete PCM frames are prequeued back-to-back"))
+    {
+        return;
+    }
+
+    PipeMessageReader reader;
+    Message out{};
+    if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader begins with both frames already queued") ||
+        !Check(AwaitReader(reader, out, 1000U) == PipeResult::Success, "reader completes the first prequeued PCM frame"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+    Check(MessageMatches(out, first), "first read ends exactly after the first header and PCM payload");
+
+    if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader begins at the exact next-frame boundary") ||
+        !Check(AwaitReader(reader, out, 1000U) == PipeResult::Success, "reader completes the adjacent PCM frame"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+    Check(MessageMatches(out, second), "adjacent frame remains intact after the preceding PCM read");
+}
+
+void TestFragmentedHeadersDeliverForSeveralSplitPoints()
+{
+    constexpr std::array<std::size_t, 3U> prefixSizes{1U, 7U, c_headerBytes - 1U};
+    for (const std::size_t prefixBytes : prefixSizes)
+    {
+        OwnedHandle server;
+        OwnedHandle client;
+        if (!Check(CreatePipePair(server, client), "pipe pair opens for fragmented header test"))
+        {
+            return;
+        }
+
+        const Message expected = MakePcmMessage(20U + prefixBytes, 80U, static_cast<std::uint8_t>(0x40U + prefixBytes));
+        std::vector<std::uint8_t> wire;
+        if (!Check(Encode(expected, wire), "fragmented-header PCM frame encodes"))
+        {
+            return;
+        }
+
+        PipeMessageReader reader;
+        Message out{};
+        const std::string splitDescription = "reader starts for header split after " + std::to_string(prefixBytes) + " byte(s)";
+        if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, splitDescription.c_str()))
+        {
+            return;
+        }
+
+        const std::vector<std::uint8_t> prefix(wire.begin(), wire.begin() + static_cast<std::ptrdiff_t>(prefixBytes));
+        const std::string prefixDescription = "first " + std::to_string(prefixBytes) + " header byte(s) arrive";
+        const std::string completionDescription = "first " + std::to_string(prefixBytes) + " header byte(s) complete promptly";
+        const std::string partialDescription =
+            "reader waits for the remaining " + std::to_string(c_headerBytes - prefixBytes) + " header byte(s)";
+        if (!Check(WriteAll(client.Get(), prefix), prefixDescription.c_str()) ||
+            !Check(WaitForSingleObject(reader.Event(), 1000U) == WAIT_OBJECT_0, completionDescription.c_str()) ||
+            !Check(reader.Advance(out) == PipeResult::Pending, partialDescription.c_str()))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+
+        const std::vector<std::uint8_t> suffix(wire.begin() + static_cast<std::ptrdiff_t>(prefixBytes), wire.end());
+        const std::string suffixDescription =
+            "remaining header and payload arrive after " + std::to_string(prefixBytes) + " byte(s)";
+        const std::string successDescription =
+            "fragmented PCM frame completes after split at " + std::to_string(prefixBytes) + " byte(s)";
+        if (!Check(WriteAll(client.Get(), suffix), suffixDescription.c_str()) ||
+            !Check(AwaitReader(reader, out, 1000U) == PipeResult::Success, successDescription.c_str()))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+        Check(MessageMatches(out, expected), "fragmented header and payload preserve the full decoded message");
+    }
+}
+
+void TestMidHeaderDisconnectPreservesOutput()
+{
+    OwnedHandle server;
+    OwnedHandle client;
+    Check(CreatePipePair(server, client), "pipe pair opens for mid-header disconnect test");
+    if (!server || !client)
+    {
+        return;
+    }
+
+    PipeMessageReader reader;
+    const Message expected = MakeMessage(MessageType::Hello, 29U);
+    std::vector<std::uint8_t> wire;
+    if (!Check(Encode(expected, wire), "disconnect test Hello frame encodes"))
+    {
+        return;
+    }
+
+    Message out = MakePcmMessage(98U, 28U, 0xE1U);
+    const Message unchanged = out;
+    const std::size_t prefixBytes = 7U;
+    std::vector<std::uint8_t> prefix(wire.begin(), wire.begin() + static_cast<std::ptrdiff_t>(prefixBytes));
+    if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader starts before mid-header disconnect") ||
+        !Check(WriteAll(client.Get(), prefix), "partial header reaches the reader before disconnect") ||
+        !Check(
+            WaitForSingleObject(reader.Event(), 1000U) == WAIT_OBJECT_0,
+            "partial header completes the pending read before disconnect") ||
+        !Check(reader.Advance(out) == PipeResult::Pending, "reader waits for the rest of the header before disconnect"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+
+    client.Reset();
+    if (!Check(AwaitReader(reader, out, 1000U) == PipeResult::Disconnected, "disconnect during a partial header is reported"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+    Check(MessageMatches(out, unchanged), "mid-header disconnect leaves the caller message unchanged");
 }
 
 void TestConcurrentReadWriteAndBufferReuse()
@@ -769,14 +949,33 @@ void TestCancellationAndWriterTimeoutRecovery()
     }
 
     PipeMessageReader reader;
-    Message out{};
+    Message out = MakePcmMessage(31U, 64U, 0x57U);
+    const Message unchanged = out;
+    const Message cancellationProbe = MakeMessage(MessageType::Hello, 32U);
+    std::vector<std::uint8_t> cancellationProbeWire;
+    if (!Check(Encode(cancellationProbe, cancellationProbeWire), "cancellation probe frame encodes"))
+    {
+        return;
+    }
     if (!Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader starts before cancellation"))
     {
         return;
     }
     Check(reader.Begin(server.Get(), 1000U) == PipeResult::IoError, "reader rejects a second Begin while the first read is pending");
+    const std::vector<std::uint8_t> cancellationPrefix(cancellationProbeWire.begin(), cancellationProbeWire.begin() + 1);
+    if (!Check(WriteAll(client.Get(), cancellationPrefix), "one header byte reaches the reader before cancellation") ||
+        !Check(
+            WaitForSingleObject(reader.Event(), 1000U) == WAIT_OBJECT_0,
+            "reader's pending header read completes before cancellation") ||
+        !Check(reader.Advance(out) == PipeResult::Pending, "reader remains mid-header before cancellation"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+    Check(MessageMatches(out, unchanged), "partial header leaves the caller message unchanged before cancellation");
     reader.CancelAndDrain();
     Check(reader.Advance(out) == PipeResult::IoError, "drained reader returns to idle after explicit cancellation");
+    Check(MessageMatches(out, unchanged), "mid-header cancellation leaves the caller message unchanged");
 
     server.Reset();
     client.Reset();
@@ -866,6 +1065,9 @@ int main()
 {
     TestIdleReaderPartialTimeoutAndRecovery();
     TestInvalidHeaderBeforePayloadAndOutPreservation();
+    TestPrequeuedPcmFramesRespectExactBoundary();
+    TestFragmentedHeadersDeliverForSeveralSplitPoints();
+    TestMidHeaderDisconnectPreservesOutput();
     TestConcurrentReadWriteAndBufferReuse();
     TestReaderRecyclesPayloadBuffersAcrossFourMessages();
     TestPreparedWriterExactWireOwnershipAndBufferReuse();
