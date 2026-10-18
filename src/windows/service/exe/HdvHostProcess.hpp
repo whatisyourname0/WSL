@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@
 #include <wil/result.h>
 
 #include "CaptureEventScheduler.hpp"
+#include "CaptureHostTimingDiagnostics.hpp"
 #include "HdvPciDeviceHost.hpp"
 #include "WindowsCaptureSource.hpp"
 #include "../../virtiosound/src/windows/AudioSourceTrace.hpp"
@@ -133,8 +135,46 @@ inline int Run(int argc, wchar_t** argv) noexcept
             return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(time - clockOrigin).count());
         };
         detail::CaptureEventScheduler scheduler;
+        detail::CaptureHostTimingRing timingEvents;
+        [[maybe_unused]] auto traceTimingEvents = wil::scope_exit([&]() noexcept {
+            native::windows::detail::TraceAudioSource(L"HostPumpRing", timingEvents.Count(), timingEvents.TotalRecorded());
+            for (std::size_t index = 0; index < timingEvents.Count(); ++index)
+            {
+                const auto* event = timingEvents.Oldest(index);
+                if (!event)
+                {
+                    continue;
+                }
+
+                wchar_t detailText[190]{};
+                // Compact field order: sequence, flags, wait start/requested/return/actual,
+                // service start/duration, wait result/reason, frames, generation.
+                if (swprintf_s(
+                        detailText,
+                        ARRAYSIZE(detailText),
+                        L"HP %llx %x %llx %llx %llx %llx %llx %llx %x %x %d %llx",
+                        static_cast<unsigned long long>(event->m_sequence),
+                        static_cast<unsigned int>(event->m_flags),
+                        static_cast<unsigned long long>(event->m_waitStartedAtNanoseconds),
+                        static_cast<unsigned long long>(event->m_requestedWaitNanoseconds),
+                        static_cast<unsigned long long>(event->m_waitReturnedAtNanoseconds),
+                        static_cast<unsigned long long>(event->m_actualWaitNanoseconds),
+                        static_cast<unsigned long long>(event->m_serviceStartedAtNanoseconds),
+                        static_cast<unsigned long long>(event->m_serviceDurationNanoseconds),
+                        static_cast<unsigned int>(event->m_waitResult),
+                        static_cast<unsigned int>(event->m_waitReason),
+                        static_cast<int>(event->m_frames),
+                        static_cast<unsigned long long>(event->m_generation)) > 0)
+                {
+                    native::windows::detail::TraceAudioSource(detailText);
+                }
+            }
+        });
         std::uint64_t eventWakes{}, deadlineWakes{}, emptyServices{}, deferredServices{}, completedFrames{};
         std::uint64_t sourceWakes{}, guestWakes{}, serviceNanoseconds{}, maximumServiceNanoseconds{};
+        std::uint64_t lastGeneration{};
+        auto lastWaitReason = native::CaptureWaitReason::Idle;
+        native::windows::detail::TraceAudioSource(L"HostPumpClockOrigin", toNanoseconds(clock::now()));
         // A startup rescan covers state published before this loop began.
         captureWake->Notify(native::windows::CaptureWakeReason::GuestState);
         const HANDLE waits[]{stop, parent, captureWake->Event()};
@@ -142,10 +182,27 @@ inline int Run(int argc, wchar_t** argv) noexcept
         {
             const auto beforeWait = clock::now();
             const auto beforeWaitNanoseconds = toNanoseconds(beforeWait);
-            const DWORD wait = WaitForMultipleObjects(3, waits, FALSE, scheduler.WaitTimeoutMilliseconds(beforeWaitNanoseconds));
+            const auto requestedWaitMilliseconds = scheduler.WaitTimeoutMilliseconds(beforeWaitNanoseconds);
+            const DWORD wait = WaitForMultipleObjects(3, waits, FALSE, requestedWaitMilliseconds);
+            const DWORD waitError = wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+            const auto waitReturned = clock::now();
+            const auto waitReturnedNanoseconds = toNanoseconds(waitReturned);
+            auto recordWaitOnlyIfSlow = [&]() noexcept {
+                (void)timingEvents.RecordIfSlow(
+                    beforeWaitNanoseconds,
+                    requestedWaitMilliseconds,
+                    waitReturnedNanoseconds,
+                    static_cast<std::uint32_t>(wait),
+                    waitReturnedNanoseconds,
+                    0,
+                    static_cast<std::uint8_t>(lastWaitReason),
+                    0,
+                    lastGeneration);
+            };
             if (wait == WAIT_OBJECT_0)
             {
                 // The parent signals stop only after confirming guest shutdown.
+                recordWaitOnlyIfSlow();
                 break;
             }
             if (wait == WAIT_OBJECT_0 + 1)
@@ -153,6 +210,7 @@ inline int Run(int argc, wchar_t** argv) noexcept
                 // Parent death does not prove that the guest stopped. Close the
                 // capture source during unwinding and let process exit release
                 // the process-pinned callback root; never claim guest retirement.
+                recordWaitOnlyIfSlow();
                 if (source)
                 {
                     source->Shutdown();
@@ -164,10 +222,12 @@ inline int Run(int argc, wchar_t** argv) noexcept
             {
                 // Fail closed: unwinding shuts down the source, but leaves the
                 // callback root pinned until this child process exits.
-                THROW_LAST_ERROR();
+                recordWaitOnlyIfSlow();
+                THROW_WIN32(waitError);
             }
             if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0 + 2)
             {
+                recordWaitOnlyIfSlow();
                 THROW_HR(E_UNEXPECTED);
             }
 
@@ -192,6 +252,18 @@ inline int Run(int argc, wchar_t** argv) noexcept
             const auto result = host->ServiceCapture(elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0, allowTransfer);
             scheduler.OnService(startedAt, result);
             const auto duration = toNanoseconds(clock::now()) - startedAt;
+            (void)timingEvents.RecordIfSlow(
+                beforeWaitNanoseconds,
+                requestedWaitMilliseconds,
+                waitReturnedNanoseconds,
+                static_cast<std::uint32_t>(wait),
+                startedAt,
+                duration,
+                static_cast<std::uint8_t>(result.m_waitReason),
+                static_cast<std::int32_t>(result.m_frames),
+                result.m_generation);
+            lastGeneration = result.m_generation;
+            lastWaitReason = result.m_waitReason;
             serviceNanoseconds += duration;
             maximumServiceNanoseconds = (std::max)(maximumServiceNanoseconds, duration);
             emptyServices += result.m_frames == 0;

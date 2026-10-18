@@ -27,7 +27,7 @@ namespace wsl::virtio_sound::audio_worker {
 namespace {
 
     constexpr DWORD c_knownCaptureFlags = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY | AUDCLNT_BUFFERFLAGS_SILENT | AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR;
-    constexpr std::uint32_t c_maximumPacketBytes = MaximumCapturePacketFrames() * static_cast<std::uint32_t>(RequiredBytesPerFrame());
+    constexpr std::size_t c_maximumPacketBytes = MaximumCapturePacketBytes();
     using CaptureClock = std::chrono::steady_clock;
 
     std::uint64_t ElapsedMicroseconds(CaptureClock::time_point start, CaptureClock::time_point end) noexcept
@@ -370,7 +370,7 @@ namespace {
             m_haveLastReadStart = true;
 
             error = {};
-            packet = {};
+            ResetCapturePacket(packet);
             if (stopRequested.load(std::memory_order_acquire))
             {
                 return CaptureReadResult::Stopped;
@@ -526,6 +526,7 @@ namespace {
             UpdateMaximum(m_maxBufferHoldUs, ElapsedMicroseconds(bufferAcquiredAt, CaptureClock::now()));
             if (SetWasapiErrorIfFailed(releaseResult, CaptureErrorCode::ReadFailed, L"IAudioCaptureClient::ReleaseBuffer", error))
             {
+                ResetCapturePacket(packet);
                 return CaptureReadResult::Failed;
             }
             const WasapiPacketFlagDecision flagDecision = m_initialPacketPolicy.Evaluate(
@@ -538,11 +539,13 @@ namespace {
             }
             if (!packetValid)
             {
+                ResetCapturePacket(packet);
                 error = std::move(packetError);
                 return CaptureReadResult::Failed;
             }
             if (frames == 0)
             {
+                ResetCapturePacket(packet);
                 return CaptureReadResult::Timeout;
             }
 

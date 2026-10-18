@@ -485,11 +485,15 @@ private:
     void WorkerMain(const std::wstring& endpointId) noexcept
     {
         std::unique_ptr<ICaptureDevice> device;
+        CapturePacket packet;
         CaptureError workerError;
         bool failed = false;
         bool firstPacketLogged = false;
         try
         {
+            // Keep packet storage bounded and allocate it before the device
+            // starts producing realtime capture data.
+            packet.m_s16LeBytes.reserve(MaximumCapturePacketBytes());
             device = m_factory->Create();
             if (!device)
             {
@@ -543,7 +547,7 @@ private:
                         CompleteStartup(WorkerState::Running, {});
                         while (!m_stopRequested.load(std::memory_order_acquire))
                         {
-                            CapturePacket packet;
+                            ResetCapturePacket(packet);
                             workerError = {};
                             const auto result = device->ReadPacketInterruptible(
                                 c_captureWaitTimeout,
@@ -555,6 +559,13 @@ private:
 #endif
                                 packet,
                                 workerError);
+                            if (result != CaptureReadResult::Packet)
+                            {
+                                // Devices must leave non-packet results empty;
+                                // enforce that contract even for adapters that
+                                // wrote partial data before timing out or failing.
+                                ResetCapturePacket(packet);
+                            }
                             if (result == CaptureReadResult::Packet && !firstPacketLogged)
                             {
                                 detail::TraceAudioWorker(L"FirstPacket", packet.m_rawFlags, packet.m_frames);
@@ -585,6 +596,7 @@ private:
                             }
                             if (packet.m_frames == 0 || packet.m_frames > MaximumCapturePacketFrames())
                             {
+                                ResetCapturePacket(packet);
                                 workerError = MakeError(
                                     CaptureErrorCode::InvalidPacket,
                                     L"The capture device returned an invalid or oversized PCM packet.");
@@ -599,6 +611,7 @@ private:
                             {
                                 detail::TraceAudioWorker(L"DiscontinuityPacket", packet.m_rawFlags, packet.m_frames);
                                 m_queue.DiscardForDiscontinuity();
+                                ResetCapturePacket(packet);
                                 workerError = MakeError(
                                     CaptureErrorCode::CaptureDiscontinuity,
                                     L"The capture endpoint reported a discontinuity; buffered PCM was discarded.");
@@ -612,6 +625,7 @@ private:
                             const QueueWriteResult writeResult = m_queue.TryWrite(packet);
                             if (writeResult == QueueWriteResult::InvalidPacket)
                             {
+                                ResetCapturePacket(packet);
                                 workerError = MakeError(
                                     CaptureErrorCode::InvalidPacket, L"The capture device returned an invalid S16LE packet size.");
                                 failed = true;
@@ -623,6 +637,7 @@ private:
                             }
                             if (writeResult == QueueWriteResult::Overflow)
                             {
+                                ResetCapturePacket(packet);
                                 workerError = MakeError(
                                     CaptureErrorCode::BufferOverflow,
                                     L"The bounded PCM queue overflowed; capture stopped to avoid an unreported audio gap.");
@@ -637,6 +652,7 @@ private:
         }
         catch (const std::exception&)
         {
+            ResetCapturePacket(packet);
             detail::TraceAudioWorker(L"WorkerException", 1, static_cast<std::uint64_t>(CaptureErrorCode::WorkerFailed));
             workerError = MakeError(CaptureErrorCode::WorkerFailed, L"An exception interrupted the capture worker.");
             failed = true;
@@ -644,6 +660,7 @@ private:
         }
         catch (...)
         {
+            ResetCapturePacket(packet);
             detail::TraceAudioWorker(L"WorkerException", 2, static_cast<std::uint64_t>(CaptureErrorCode::WorkerFailed));
             workerError = MakeError(CaptureErrorCode::WorkerFailed, L"An unknown error interrupted the capture worker.");
             failed = true;

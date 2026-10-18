@@ -33,6 +33,16 @@ void Require(bool condition, const char* message)
 
 struct FakeCaptureControl
 {
+    struct PacketReadObservation
+    {
+        std::uintptr_t m_bufferAddress{};
+        std::size_t m_capacity{};
+        std::uint32_t m_frames{};
+        std::size_t m_size{};
+        bool m_discontinuity{};
+        std::uint32_t m_rawFlags{};
+    };
+
     std::atomic<int> createCalls{};
     std::atomic<int> openCalls{};
     std::atomic<int> startCalls{};
@@ -45,6 +55,10 @@ struct FakeCaptureControl
     std::mutex mutex;
     std::condition_variable condition;
     std::deque<CapturePacket> packets;
+    std::vector<PacketReadObservation> readObservations;
+    std::size_t successfulPacketReads{};
+    std::size_t timeoutCalls{};
+    bool pollutePacketOnTimeout{};
     bool requestReadFailure{};
     bool waitForStopEvent{};
     bool waitingForStopEvent{};
@@ -94,6 +108,13 @@ public:
     {
         ++control_->readCalls;
         std::unique_lock<std::mutex> lock(control_->mutex);
+        control_->readObservations.push_back({
+            reinterpret_cast<std::uintptr_t>(packet.m_s16LeBytes.data()),
+            packet.m_s16LeBytes.capacity(),
+            packet.m_frames,
+            packet.m_s16LeBytes.size(),
+            packet.m_discontinuity,
+            packet.m_rawFlags});
         control_->condition.wait_for(
             lock, timeout, [&] { return !control_->packets.empty() || control_->requestReadFailure || stopRequested.load(); });
         if (stopRequested.load())
@@ -108,10 +129,24 @@ public:
         }
         if (control_->packets.empty())
         {
+            ++control_->timeoutCalls;
+            if (control_->pollutePacketOnTimeout && control_->successfulPacketReads != 0)
+            {
+                packet.m_frames = 1;
+                packet.m_s16LeBytes.assign(RequiredBytesPerFrame(), std::uint8_t{0xE7});
+                packet.m_discontinuity = true;
+                packet.m_rawFlags = 0xFFFFFFFFU;
+            }
+            control_->condition.notify_all();
             return CaptureReadResult::Timeout;
         }
-        packet = std::move(control_->packets.front());
+        CapturePacket queuedPacket = std::move(control_->packets.front());
         control_->packets.pop_front();
+        packet.m_frames = queuedPacket.m_frames;
+        packet.m_s16LeBytes.assign(queuedPacket.m_s16LeBytes.begin(), queuedPacket.m_s16LeBytes.end());
+        packet.m_discontinuity = queuedPacket.m_discontinuity;
+        packet.m_rawFlags = queuedPacket.m_rawFlags;
+        ++control_->successfulPacketReads;
         return CaptureReadResult::Packet;
     }
 
@@ -232,6 +267,75 @@ bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout = 3000ms)
 std::unique_ptr<ICaptureDeviceFactory> MakeFactory(const std::shared_ptr<FakeCaptureControl>& control)
 {
     return std::make_unique<FakeCaptureDeviceFactory>(control);
+}
+
+void TestResetCapturePacketRetainsBoundedStorage()
+{
+    CapturePacket packet;
+    packet.m_s16LeBytes.reserve(MaximumCapturePacketBytes());
+    packet.m_frames = 3;
+    packet.m_s16LeBytes.assign(3 * RequiredBytesPerFrame(), std::uint8_t{0xA5});
+    packet.m_discontinuity = true;
+    packet.m_rawFlags = 0x12345678U;
+    const auto capacity = packet.m_s16LeBytes.capacity();
+    const auto bufferAddress = reinterpret_cast<std::uintptr_t>(packet.m_s16LeBytes.data());
+
+    ResetCapturePacket(packet);
+
+    Require(packet.m_frames == 0 && packet.m_s16LeBytes.empty(), "packet reset should clear frame and sample counts");
+    Require(!packet.m_discontinuity && packet.m_rawFlags == 0, "packet reset should clear all metadata");
+    Require(packet.m_s16LeBytes.capacity() == capacity, "packet reset should retain its bounded storage");
+    Require(
+        reinterpret_cast<std::uintptr_t>(packet.m_s16LeBytes.data()) == bufferAddress,
+        "packet reset should keep the allocated sample buffer for reuse");
+}
+
+void TestWorkerReusesPacketStorageAndClearsTimeoutOutput()
+{
+    auto control = std::make_shared<FakeCaptureControl>();
+    control->pollutePacketOnTimeout = true;
+    AudioCaptureWorker worker(MakeFactory(control), 16);
+    CaptureError error;
+    Require(worker.Start(L"explicit-test-endpoint", error), "fake capture should start");
+
+    PushPacket(control, MakePacket(2, 10));
+    Require(WaitUntil([&] { return worker.Snapshot().m_framesWritten == 2; }), "first packet should be written");
+    Require(
+        WaitUntil([&] {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            return control->timeoutCalls != 0;
+        }),
+        "the fake device should return a timeout after the first packet");
+
+    PushPacket(control, MakePacket(2, 70));
+    Require(WaitUntil([&] { return worker.Snapshot().m_framesWritten == 4; }), "second packet should be written after timeout");
+
+    std::vector<FakeCaptureControl::PacketReadObservation> observations;
+    {
+        std::lock_guard<std::mutex> lock(control->mutex);
+        observations = control->readObservations;
+    }
+    Require(observations.size() >= 3, "the fake should observe reads before and after the timeout");
+    const auto initialBufferAddress = observations.front().m_bufferAddress;
+    for (const auto& observation : observations)
+    {
+        Require(
+            observation.m_capacity >= MaximumCapturePacketBytes(),
+            "capture packet storage should be reserved before the first device read");
+        Require(
+            observation.m_bufferAddress == initialBufferAddress,
+            "successive capture reads should reuse the same sample allocation");
+        Require(
+            observation.m_frames == 0 && observation.m_size == 0 && !observation.m_discontinuity && observation.m_rawFlags == 0,
+            "each read should begin with empty packet metadata, including after a dirty timeout");
+    }
+
+    std::vector<std::uint8_t> output(4 * RequiredBytesPerFrame());
+    Require(worker.ReadFrames(output.data(), 4, output.size()) == 4, "both real packets should remain available to the consumer");
+    Require(
+        output[0] == 10 && output[7] == 17 && output[8] == 70 && output[15] == 77,
+        "timeout output must not replace or contaminate the real captured samples");
+    Require(worker.Stop(error), "fake capture should stop cleanly");
 }
 
 void TestConstructionIsInertAndStartUsesExplicitEndpoint()
@@ -525,6 +629,8 @@ int main()
 {
     try
     {
+        TestResetCapturePacketRetainsBoundedStorage();
+        TestWorkerReusesPacketStorageAndClearsTimeoutOutput();
         TestConstructionIsInertAndStartUsesExplicitEndpoint();
         TestQueueReadinessEventTracksQueuedFrames();
         TestStopEventInterruptsDeviceReadOnCaptureThread();

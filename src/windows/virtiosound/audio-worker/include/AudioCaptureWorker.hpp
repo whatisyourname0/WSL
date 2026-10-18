@@ -37,6 +37,11 @@ constexpr std::uint32_t MaximumCapturePacketFrames() noexcept
     return 48000;
 }
 
+constexpr std::size_t MaximumCapturePacketBytes() noexcept
+{
+    return static_cast<std::size_t>(MaximumCapturePacketFrames()) * RequiredBytesPerFrame();
+}
+
 enum class CaptureErrorCode
 {
     None,
@@ -72,6 +77,16 @@ struct CapturePacket
     std::uint32_t m_rawFlags{};
 };
 
+// Clear packet metadata and logical contents while retaining the vector's
+// bounded storage for the next capture read.
+inline void ResetCapturePacket(CapturePacket& packet) noexcept
+{
+    packet.m_frames = 0;
+    packet.m_s16LeBytes.clear();
+    packet.m_discontinuity = false;
+    packet.m_rawFlags = 0;
+}
+
 enum class CaptureReadResult
 {
     Packet,
@@ -83,7 +98,8 @@ enum class CaptureReadResult
 // Implementations are created and used on the worker thread. OpenEndpoint
 // must use the supplied endpoint ID and return the stream format negotiated
 // for that exact endpoint. ReadPacket must honor its timeout and must not
-// return more than MaximumCapturePacketFrames() in one packet.
+// return more than MaximumCapturePacketFrames() in one packet. Packet metadata
+// and bytes must be empty for every result other than Packet.
 class ICaptureDevice
 {
 public:
