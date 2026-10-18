@@ -63,4 +63,18 @@ if(WSL_AUDIO_WORKER_BUILD_TESTS)
     endif()
     add_test(NAME wsl_virtio_sound_wasapi_initial_packet_policy
         COMMAND wsl_virtio_sound_wasapi_initial_packet_policy_tests)
+
+    add_executable(wsl_virtio_sound_wasapi_capture_timing_tests
+        tests/WasapiCaptureTimingTests.cpp)
+    target_include_directories(wsl_virtio_sound_wasapi_capture_timing_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(wsl_virtio_sound_wasapi_capture_timing_tests
+        PRIVATE cxx_std_17)
+    if(MSVC)
+        target_compile_options(wsl_virtio_sound_wasapi_capture_timing_tests
+            PRIVATE /W4 /WX /permissive- /EHsc)
+    endif()
+    add_test(NAME wsl_virtio_sound_wasapi_capture_timing
+        COMMAND wsl_virtio_sound_wasapi_capture_timing_tests)
 endif()

@@ -19,6 +19,7 @@
 
 #include "AudioCaptureWorker.hpp"
 #include "AudioWorkerTrace.hpp"
+#include "WasapiCaptureTiming.hpp"
 #include "WasapiInitialPacketPolicy.hpp"
 
 namespace wsl::virtio_sound::audio_worker {
@@ -195,8 +196,17 @@ namespace {
                 return false;
             }
 
+            // Keep draining on capture events, but retain enough engine-side
+            // history to tolerate a short scheduling stall. Capacity is not a
+            // batching interval: neither the event period nor guest pacing changes.
+            const REFERENCE_TIME bufferDuration = static_cast<REFERENCE_TIME>(c_captureBufferReserve.count()) * 10000;
             result = m_audioClient->Initialize(
-                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST, 0, 0, &requiredFormat.Format, nullptr);
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+                bufferDuration,
+                0,
+                &requiredFormat.Format,
+                nullptr);
             if (SetWasapiErrorIfFailed(result, CaptureErrorCode::EndpointOpenFailed, L"IAudioClient::Initialize", error))
             {
                 return false;
@@ -323,13 +333,11 @@ namespace {
             }
             if (nextPacketFrames == 0)
             {
-                // Keep event-driven capture idle between packets, but periodically
-                // re-enter GetNextPacketSize so endpoint invalidation is observed
-                // even if the audio engine stops producing capture callbacks.
-                constexpr auto c_endpointHealthCheckInterval = std::chrono::milliseconds{1000};
-                const auto effectiveTimeout = timeout == std::chrono::milliseconds::max()
-                    ? c_endpointHealthCheckInterval
-                    : (std::min)(timeout, c_endpointHealthCheckInterval);
+                // The event is the normal wake source. If a notification is
+                // delayed or lost, inspect the queue before the actual endpoint
+                // capacity is exhausted rather than waiting a whole second.
+                const auto effectiveTimeout = CaptureNotificationWaitTimeout(
+                    timeout, m_endpointBufferFramesValid ? m_endpointBufferFrames : 0U, RequiredCaptureFormat().m_sampleRate);
                 const auto timeoutCount = (std::max)(effectiveTimeout.count(), std::chrono::milliseconds::rep{0});
                 const auto maximumWait = static_cast<std::chrono::milliseconds::rep>(MAXDWORD - 1);
                 const DWORD waitMilliseconds = static_cast<DWORD>((std::min)(timeoutCount, maximumWait));
@@ -353,6 +361,7 @@ namespace {
                 }
                 if (waitResult == WAIT_TIMEOUT)
                 {
+                    ++m_notificationTimeoutCount;
                     return stopRequested.load(std::memory_order_acquire) ? CaptureReadResult::Stopped : CaptureReadResult::Timeout;
                 }
                 if (waitResult != WAIT_OBJECT_0 + captureHandleIndex)
@@ -627,6 +636,12 @@ namespace {
             detail::TraceAudioWorker(L"CaptureDiagnosticsTimestampErrors", m_timestampErrorCount, m_getBufferCount);
             detail::TraceAudioWorker(L"CaptureDiagnosticsReadLoopGapUs", m_readCallCount, m_maxInterReadGapUs);
             detail::TraceAudioWorker(L"CaptureDiagnosticsWaitWallUs", m_waitCallCount, m_maxWaitWallUs);
+            detail::TraceAudioWorker(
+                L"CaptureDiagnosticsNotificationWatchdog",
+                m_notificationTimeoutCount,
+                static_cast<std::uint64_t>(CaptureNotificationWaitTimeout(
+                    std::chrono::milliseconds::max(), m_endpointBufferFramesValid ? m_endpointBufferFrames : 0U,
+                    RequiredCaptureFormat().m_sampleRate).count()));
             detail::TraceAudioWorker(L"CaptureDiagnosticsBufferHoldUs", m_getBufferCount, m_maxBufferHoldUs);
             detail::TraceAudioWorker(L"CaptureDiagnosticsEndpointBufferFrames",
                 m_endpointBufferFramesValid ? m_endpointBufferFrames : 0U,
@@ -653,6 +668,7 @@ namespace {
         std::uint32_t m_endpointBufferFrames{};
         std::uint64_t m_readCallCount{};
         std::uint64_t m_waitCallCount{};
+        std::uint64_t m_notificationTimeoutCount{};
         std::uint64_t m_getBufferCount{};
         std::uint64_t m_capturePacketCount{};
         std::uint64_t m_discontinuityCount{};
