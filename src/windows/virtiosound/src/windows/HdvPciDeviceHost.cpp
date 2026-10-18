@@ -509,6 +509,9 @@ public:
     HDV_DEVICE m_deviceHandle{};
     std::atomic<HRESULT> m_creationResult{E_PENDING};
     std::atomic<HRESULT> m_lastHostError{S_OK};
+    // Kept separate from the core notification counter: these exact RX kicks
+    // are deliberately handled by the adapter without entering the device gate.
+    std::atomic<std::uint64_t> m_rxCallbackFastPathRequests{};
     mutable std::mutex m_lifecycleMutex;
     std::condition_variable m_lifecycleChanged;
     _Guarded_by_(m_lifecycleMutex) std::uint32_t m_activeOperations {};
@@ -1109,6 +1112,17 @@ public:
             return E_INVALIDARG;
         }
         return Guard(context, [offset, length, value](BackendState& state) {
+            // A valid RX queue kick is a rescan request only. RX queue work is
+            // paced by ServiceCapture, so avoid taking VirtioSoundDevice's
+            // gate here; ServiceCapture can hold it while doing guest-memory
+            // and interrupt work. Keep this branch exact so malformed writes
+            // retain the core's validation and fault behavior.
+            if (offset == 0x30c && length == sizeof(std::uint16_t) && value[0] == 3 && value[1] == 0 && state.m_wake)
+            {
+                state.m_rxCallbackFastPathRequests.fetch_add(1, std::memory_order_relaxed);
+                state.m_wake->Notify(CaptureWakeReason::GuestQueue);
+                return S_OK;
+            }
             state.m_device->WriteBar(offset, value, static_cast<std::size_t>(length));
             if (state.m_wake)
             {
@@ -1260,6 +1274,7 @@ RetireOutcome HdvPciDeviceHost::GuestStoppedAndRetire() noexcept
         detail::TraceAudioSource(L"CaptureIntervalMax", capture.m_captureMaximumElapsedNanoseconds);
         detail::TraceAudioSource(L"CaptureBacklogMax", capture.m_captureMaximumSourceAvailableFrames, capture.m_captureMaximumRxOutstandingAvailable);
         detail::TraceAudioSource(L"CaptureScratch", capture.m_captureScratchCapacityGrowths, capture.m_captureScratchCapacityBytes);
+        detail::TraceAudioSource(L"CaptureRxKickFastPathRequests", state.m_rxCallbackFastPathRequests.load(std::memory_order_relaxed));
     }
     catch (...)
     {

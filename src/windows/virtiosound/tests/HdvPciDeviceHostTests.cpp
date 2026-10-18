@@ -13,9 +13,11 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace wsl::virtio_sound::native::windows::testing {
@@ -54,6 +56,7 @@ void ResetGuestMemoryApertureBatchStatsForTesting() noexcept;
 } // namespace wsl::virtio_sound::native::windows::testing
 
 namespace {
+using wsl::virtio_sound::native::PcmSource;
 using namespace wsl::virtio_sound::native::windows;
 
 constexpr unsigned int c_testHookCallbackAdmitted = 1;
@@ -983,6 +986,204 @@ void TestSuccessfulSharedHostRetiresPinned()
     Require(g_fake.teardownCalls == 0, "unknown/shared host called HdvTeardownDeviceHost");
 }
 
+class GateHoldingPcmSource final : public PcmSource
+{
+public:
+    bool ReadFrames(std::uint32_t, std::uint8_t*, std::size_t) noexcept override { return true; }
+    void Reset() noexcept override {}
+
+    // This fake intentionally blocks a state query so the test can hold the
+    // device gate while exercising the independent BAR callback path.
+    std::optional<std::uint32_t> AvailableFrames() const noexcept override
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_blockNext)
+        {
+            m_blockNext = false;
+            m_entered = true;
+            m_changed.notify_all();
+            m_changed.wait(lock, [this] { return m_release; });
+        }
+        return std::nullopt;
+    }
+
+    void BlockNextAvailability() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_blockNext = true;
+        m_entered = false;
+        m_release = false;
+    }
+
+    bool WaitUntilBlocked(std::chrono::milliseconds timeout) const
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_changed.wait_for(lock, timeout, [this] { return m_entered; });
+    }
+
+    void Release() const
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_release = true;
+        }
+        m_changed.notify_all();
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    mutable std::condition_variable m_changed;
+    mutable bool m_blockNext{};
+    mutable bool m_entered{};
+    mutable bool m_release{};
+};
+
+std::unique_ptr<HdvPciDeviceHost> CreateStartedHostWithSource(
+    std::shared_ptr<PcmSource> source, std::shared_ptr<CaptureWakeSignal> wake)
+{
+    auto host = HdvPciDeviceHost::CreateBorrowed(
+        FakeSystem(), c_deviceClassId, c_deviceInstanceId, std::move(source), HostOwnership::VerifiedExclusive, std::move(wake));
+    const auto callbacks = GetCallbackSnapshot();
+    Require(callbacks.deviceInterface.Start(callbacks.context) == S_OK, "fake HDV Start callback failed");
+    return host;
+}
+
+void TestRxKickFastPathAndLegacyValidation()
+{
+    ResetFake();
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource({}, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the RX validation owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "Start used the wrong validation wake reason");
+
+    const std::array<BYTE, 2> validRxKick{3, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "valid RX queue kick failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "valid RX queue kick did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "valid RX kick used the wrong wake reason");
+    auto snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 0 && snapshot.m_notificationFailures == 0,
+        "valid RX fast-path kick changed the core notification counters");
+
+    const std::array<BYTE, 2> wrongQueueValue{2, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, wrongQueueValue.size(), wrongQueueValue.data()) == S_OK,
+        "mismatched RX queue kick changed the callback HRESULT");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "legacy mismatched kick did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "legacy RX kick used the wrong wake reason");
+    snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 1 && snapshot.m_notificationFailures == 1,
+        "mismatched RX kick did not retain core validation and accounting");
+
+    const std::array<BYTE, 4> wrongWidthValue{3, 0, 0, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, wrongWidthValue.size(), wrongWidthValue.data()) == S_OK,
+        "wrong-width RX write changed the callback HRESULT");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "legacy wrong-width write did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "wrong-width RX write used the wrong wake reason");
+    snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 1 && snapshot.m_notificationFailures == 1,
+        "wrong-width RX write was misclassified as a core queue notification");
+
+    const std::array<BYTE, 2> validTxQueueKick{2, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x308, validTxQueueKick.size(), validTxQueueKick.data()) == S_OK,
+        "non-RX queue kick failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "legacy non-RX queue kick did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "non-RX queue kick changed its legacy wake reason");
+    snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 2 && snapshot.m_notificationFailures == 1,
+        "non-RX queue kick did not retain core notification accounting");
+    Require(
+        host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "fast-path validation host did not retire cleanly");
+
+    ResetFake();
+    auto noWakeHost = CreateStartedHostWithSource({}, {});
+    const auto noWakeCallbacks = GetCallbackSnapshot();
+    Require(
+        noWakeCallbacks.deviceInterface.WriteInterceptedMemory(
+            noWakeCallbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "valid RX kick without a wake signal failed");
+    snapshot = noWakeHost->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 1 && snapshot.m_notificationFailures == 0,
+        "valid RX kick without a wake signal bypassed the core notification path");
+    Require(
+        noWakeHost->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "no-wake RX host did not retire cleanly");
+}
+
+void TestRxKickCompletesWhileServiceCaptureHoldsDeviceGate()
+{
+    ResetFake();
+    auto source = std::make_shared<GateHoldingPcmSource>();
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource(source, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the gate-held test owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "Start used the wrong gate-test wake reason");
+
+    source->BlockNextAvailability();
+    std::thread serviceThread([&] { (void)host->ServiceCapture(1'000'000, true); });
+    const bool serviceHoldsGate = source->WaitUntilBlocked(std::chrono::seconds(5));
+
+    std::mutex callbackMutex;
+    std::condition_variable callbackChanged;
+    bool callbackCompleted{};
+    HRESULT callbackResult{E_PENDING};
+    std::thread callbackThread;
+    if (serviceHoldsGate)
+    {
+        callbackThread = std::thread([&] {
+            const std::array<BYTE, 2> validRxKick{3, 0};
+            const HRESULT result = callbacks.deviceInterface.WriteInterceptedMemory(
+                callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data());
+            {
+                std::lock_guard<std::mutex> lock(callbackMutex);
+                callbackResult = result;
+                callbackCompleted = true;
+            }
+            callbackChanged.notify_all();
+        });
+    }
+
+    bool completedBeforeServiceRelease{};
+    if (serviceHoldsGate)
+    {
+        std::unique_lock<std::mutex> lock(callbackMutex);
+        completedBeforeServiceRelease = callbackChanged.wait_for(lock, std::chrono::seconds(5), [&] { return callbackCompleted; });
+    }
+    source->Release();
+    serviceThread.join();
+    if (callbackThread.joinable())
+    {
+        callbackThread.join();
+    }
+
+    Require(serviceHoldsGate, "ServiceCapture did not reach the gate-held source query");
+    Require(completedBeforeServiceRelease, "valid RX callback waited for ServiceCapture to release the device gate");
+    Require(callbackResult == S_OK, "valid RX callback failed while ServiceCapture held the gate");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "gate-independent RX callback did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "gate-independent RX callback used the wrong wake reason");
+    Require(
+        host->Device().GetDiagnosticsSnapshot().m_notificationRequests == 0,
+        "gate-independent RX callback entered the core notification path");
+    Require(
+        host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "gate-held callback test host did not retire cleanly");
+}
+
 void TestFailedCreateClosesAdmissionForLateCallbacks()
 {
     ResetFake(E_FAIL);
@@ -1161,6 +1362,10 @@ int main()
         std::cout << "PASS: batch cleanup waits for concurrent mapped copies\n";
         TestSuccessfulSharedHostRetiresPinned();
         std::cout << "PASS: shared-host successful create, callback table, pinning, and repeated retirement\n";
+        TestRxKickFastPathAndLegacyValidation();
+        std::cout << "PASS: exact RX kick fast path, legacy validation, wake behavior, and core counters\n";
+        TestRxKickCompletesWhileServiceCaptureHoldsDeviceGate();
+        std::cout << "PASS: RX kick callback completes while ServiceCapture holds the device gate\n";
         TestFailedCreateClosesAdmissionForLateCallbacks();
         std::cout << "PASS: failed device creation rejects late callbacks\n";
         TestNullCreateClosesAdmissionForLateCallbacks();
