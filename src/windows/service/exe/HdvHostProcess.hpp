@@ -200,6 +200,7 @@ inline int Run(int argc, wchar_t** argv) noexcept
         }
         native::windows::detail::TraceAudioSource(L"CaptureWakeTotals", eventWakes, deadlineWakes);
         native::windows::detail::TraceAudioSource(L"CaptureWakeReasons", sourceWakes, guestWakes);
+        native::windows::detail::TraceAudioSource(L"CaptureDoorbellActive", host->RxDoorbellRegistered() ? 1 : 0);
         native::windows::detail::TraceAudioSource(L"CaptureServiceEmpty", emptyServices, deferredServices);
         native::windows::detail::TraceAudioSource(L"CaptureServiceTime", serviceNanoseconds, maximumServiceNanoseconds);
         native::windows::detail::TraceAudioSource(L"CaptureServiceFrames", completedFrames);

@@ -4,6 +4,17 @@ function(wsl_virtio_sound_enable_test_warnings target)
     endif()
 endfunction()
 
+# Platform-independent policy tests for the optional HDV RX doorbell state.
+add_executable(wsl_virtio_sound_rx_doorbell_lifecycle_tests
+    RxDoorbellLifecycleTests.cpp)
+target_include_directories(wsl_virtio_sound_rx_doorbell_lifecycle_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_features(wsl_virtio_sound_rx_doorbell_lifecycle_tests
+    PRIVATE cxx_std_17)
+wsl_virtio_sound_enable_test_warnings(wsl_virtio_sound_rx_doorbell_lifecycle_tests)
+add_test(NAME wsl_virtio_sound_rx_doorbell_lifecycle
+    COMMAND wsl_virtio_sound_rx_doorbell_lifecycle_tests)
+
 add_executable(wsl_virtio_sound_event_scheduler_tests
     ../../service/exe/tests/CaptureEventSchedulerTests.cpp)
 target_link_libraries(wsl_virtio_sound_event_scheduler_tests PRIVATE wsl_virtio_sound)

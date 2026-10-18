@@ -63,6 +63,7 @@ public:
     std::uint32_t CapturePeriodFrames() const noexcept;
     std::uint32_t MaximumCaptureFrameBudget() const noexcept;
     std::uint64_t CapturePacingGeneration() const noexcept;
+    bool RxDoorbellRegistered() const noexcept;
 
     HostOwnership Ownership() const noexcept;
     HRESULT CreationResult() const noexcept;
