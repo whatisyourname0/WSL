@@ -359,6 +359,70 @@ bool DecodeHeader(const std::uint8_t* data, std::size_t size, Header& out, Error
     return true;
 }
 
+bool ValidateWireMessage(const std::uint8_t* data, std::size_t size, Error& error) noexcept
+{
+    Header header{};
+    if (!DecodeHeader(data, size, header, error))
+    {
+        return false;
+    }
+
+    const std::size_t expectedSize = c_headerBytes + header.m_payloadBytes;
+    if (size < expectedSize)
+    {
+        error = Error::TruncatedMessage;
+        return false;
+    }
+    if (size > expectedSize)
+    {
+        error = Error::TrailingBytes;
+        return false;
+    }
+
+    const std::uint8_t* payload = data + c_headerBytes;
+    if (!ValidatePayload(header, header.m_payloadBytes == 0U ? nullptr : payload, header.m_payloadBytes, error))
+    {
+        return false;
+    }
+    error = Error::None;
+    return true;
+}
+
+bool PreparePcmMessage(std::uint64_t epoch, std::uint64_t sequence, std::size_t payloadBytes, OwnedWireMessage& out, Error& error) noexcept
+{
+    if (payloadBytes > c_maxPayloadBytes)
+    {
+        error = Error::PayloadTooLarge;
+        return false;
+    }
+
+    Header header{};
+    header.m_type = MessageType::Pcm;
+    header.m_epoch = epoch;
+    header.m_sequence = sequence;
+    header.m_payloadBytes = static_cast<std::uint32_t>(payloadBytes);
+    if (!ValidateHeaderFields(header, error))
+    {
+        return false;
+    }
+
+    try
+    {
+        // Resize retains the existing PCM prefix on shrink and reuses capacity
+        // on steady-size frames. The payload begins at a stable 32-byte offset.
+        out.m_bytes.resize(c_headerBytes + payloadBytes);
+    }
+    catch (...)
+    {
+        error = Error::AllocationFailure;
+        return false;
+    }
+
+    WriteHeader(header, out.m_bytes.data());
+    error = Error::None;
+    return true;
+}
+
 bool ValidateMessage(const Message& message, Error& error) noexcept
 {
     if (message.m_payload.size() > c_maxPayloadBytes)

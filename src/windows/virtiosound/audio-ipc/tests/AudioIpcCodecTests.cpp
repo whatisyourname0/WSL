@@ -6,6 +6,7 @@
 
 #include "AudioIpcCodec.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -29,9 +30,12 @@ using wsl::virtio_sound::audio_ipc::Error;
 using wsl::virtio_sound::audio_ipc::Header;
 using wsl::virtio_sound::audio_ipc::Message;
 using wsl::virtio_sound::audio_ipc::MessageType;
+using wsl::virtio_sound::audio_ipc::OwnedWireMessage;
 using wsl::virtio_sound::audio_ipc::ParseServerIdentityPayload;
 using wsl::virtio_sound::audio_ipc::ParseStartPayload;
+using wsl::virtio_sound::audio_ipc::PreparePcmMessage;
 using wsl::virtio_sound::audio_ipc::ValidateMessage;
+using wsl::virtio_sound::audio_ipc::ValidateWireMessage;
 
 int failures = 0;
 
@@ -390,6 +394,42 @@ void TestWireBufferReuseAndExactBytes()
     Check(storageChanges == 0U, "128 alternating control and PCM encodes cause zero wire-buffer reallocations after warmup");
 }
 
+void TestPreparedPcmWireValidationAndInPlaceFinalization()
+{
+    OwnedWireMessage prepared{};
+    Error error = Error::None;
+    Check(PreparePcmMessage(7U, 19U, 128U, prepared, error), "PCM wire frame reserves a payload in one buffer");
+    for (std::size_t index = 0U; index < 128U; ++index)
+    {
+        prepared.m_bytes[c_headerBytes + index] = static_cast<std::uint8_t>((index * 13U) + 0x21U);
+    }
+    const std::vector<std::uint8_t> expectedPayload(
+        prepared.m_bytes.begin() + static_cast<std::ptrdiff_t>(c_headerBytes),
+        prepared.m_bytes.begin() + static_cast<std::ptrdiff_t>(c_headerBytes + 64U));
+    Check(PreparePcmMessage(7U, 19U, 64U, prepared, error), "PCM finalization shrinks the header and payload in place");
+    Check(prepared.m_bytes.size() == c_headerBytes + 64U, "finalized PCM frame has the exact wire length");
+    Check(ValidateWireMessage(prepared.m_bytes.data(), prepared.m_bytes.size(), error), "exact prepared PCM wire frame validates without decoding allocation");
+    Check(
+        std::equal(expectedPayload.begin(), expectedPayload.end(), prepared.m_bytes.begin() + static_cast<std::ptrdiff_t>(c_headerBytes)),
+        "shrinking the prepared PCM frame preserves captured bytes");
+
+    const Message semantic = MakeMessage(MessageType::Pcm, 7U, 19U, expectedPayload);
+    std::vector<std::uint8_t> encoded;
+    Check(EncodeMessage(semantic, encoded, error), "semantic PCM fixture encodes for prepared-wire comparison");
+    Check(encoded == prepared.m_bytes, "prepared PCM bytes match the canonical encoder exactly");
+
+    const std::vector<std::uint8_t> preserved = prepared.m_bytes;
+    Check(!PreparePcmMessage(7U, 20U, 0U, prepared, error) && error == Error::InvalidPayloadSize, "empty PCM frame preparation is rejected");
+    Check(prepared.m_bytes == preserved, "invalid PCM preparation leaves the owned wire bytes unchanged");
+
+    std::vector<std::uint8_t> malformed = preserved;
+    malformed.push_back(0U);
+    Check(!ValidateWireMessage(malformed.data(), malformed.size(), error) && error == Error::TrailingBytes, "wire validator rejects trailing bytes");
+    malformed = preserved;
+    malformed.pop_back();
+    Check(!ValidateWireMessage(malformed.data(), malformed.size(), error) && error == Error::TruncatedMessage, "wire validator rejects truncated payloads");
+}
+
 void TestPcmFaultAndControlMessages()
 {
     Error error = Error::None;
@@ -567,6 +607,7 @@ int main()
     TestStartRoundTripAndUtf16Validation();
     TestMaximumPayloadBoundaries();
     TestWireBufferReuseAndExactBytes();
+    TestPreparedPcmWireValidationAndInPlaceFinalization();
     TestPcmFaultAndControlMessages();
     TestMalformedHeadersAndLengths();
     TestMalformedPayloadsAndExactMessageSizes();

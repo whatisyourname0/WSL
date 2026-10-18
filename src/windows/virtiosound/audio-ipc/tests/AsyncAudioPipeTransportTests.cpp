@@ -15,6 +15,7 @@
 #include "AudioPipeTransport.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <iostream>
@@ -30,6 +31,9 @@ using wsl::virtio_sound::audio_ipc::EncodeMessage;
 using wsl::virtio_sound::audio_ipc::Error;
 using wsl::virtio_sound::audio_ipc::Message;
 using wsl::virtio_sound::audio_ipc::MessageType;
+using wsl::virtio_sound::audio_ipc::OwnedWireMessage;
+using wsl::virtio_sound::audio_ipc::PreparePcmMessage;
+using wsl::virtio_sound::audio_ipc::ValidateWireMessage;
 using wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter;
 using wsl::virtio_sound::audio_ipc::windows::PipeMessageReader;
 using wsl::virtio_sound::audio_ipc::windows::PipeResult;
@@ -95,7 +99,42 @@ Message MakeMessage(MessageType type, std::uint64_t sequence, std::vector<std::u
     return message;
 }
 
-bool CreatePipePair(OwnedHandle& server, OwnedHandle& client)
+bool PreparePcmWire(OwnedWireMessage& message, std::uint64_t sequence, std::size_t reservedPayloadBytes, std::size_t actualPayloadBytes, std::uint8_t seed)
+{
+    if (actualPayloadBytes == 0U || actualPayloadBytes > reservedPayloadBytes || reservedPayloadBytes > c_maxPayloadBytes)
+    {
+        return false;
+    }
+
+    Error error = Error::None;
+    if (!PreparePcmMessage(1U, sequence, reservedPayloadBytes, message, error))
+    {
+        std::cerr << "PreparePcmMessage reserve failed: " << static_cast<int>(error) << '\n';
+        return false;
+    }
+    for (std::size_t index = 0U; index < actualPayloadBytes; ++index)
+    {
+        message.m_bytes[c_headerBytes + index] = static_cast<std::uint8_t>(seed + (index * 13U));
+    }
+    if (actualPayloadBytes != reservedPayloadBytes && !PreparePcmMessage(1U, sequence, actualPayloadBytes, message, error))
+    {
+        std::cerr << "PreparePcmMessage finalize failed: " << static_cast<int>(error) << '\n';
+        return false;
+    }
+    return true;
+}
+
+Message MakePcmMessage(std::uint64_t sequence, std::size_t payloadBytes, std::uint8_t seed)
+{
+    std::vector<std::uint8_t> payload(payloadBytes);
+    for (std::size_t index = 0U; index < payloadBytes; ++index)
+    {
+        payload[index] = static_cast<std::uint8_t>(seed + (index * 13U));
+    }
+    return MakeMessage(MessageType::Pcm, sequence, std::move(payload));
+}
+
+bool CreatePipePair(OwnedHandle& server, OwnedHandle& client, DWORD serverOutputBufferBytes = 4096U)
 {
     static std::atomic<std::uint64_t> counter{};
     const std::uint64_t instance = counter.fetch_add(1U, std::memory_order_relaxed);
@@ -107,7 +146,7 @@ bool CreatePipePair(OwnedHandle& server, OwnedHandle& client)
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         1U,
-        4096U,
+        serverOutputBufferBytes,
         4096U,
         0U,
         nullptr));
@@ -460,6 +499,265 @@ void TestConcurrentReadWriteAndBufferReuse()
     }
 }
 
+void TestReaderRecyclesPayloadBuffersAcrossFourMessages()
+{
+    OwnedHandle server;
+    OwnedHandle client;
+    Check(CreatePipePair(server, client), "pipe pair opens for repeated reader buffer reuse");
+    if (!server || !client)
+    {
+        return;
+    }
+
+    PipeMessageReader reader;
+    Message received{};
+    std::array<const std::uint8_t*, 4U> payloadBuffers{};
+    for (std::uint64_t index = 0U; index < payloadBuffers.size(); ++index)
+    {
+        const std::uint64_t sequence = 60U + index;
+        const Message inbound = MakePcmMessage(sequence, 1024U, static_cast<std::uint8_t>(0x21U + index));
+        std::vector<std::uint8_t> wire;
+        if (!Check(Encode(inbound, wire), "repeated PCM frame encodes") ||
+            !Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader begins the next repeated frame") ||
+            !Check(WriteAll(client.Get(), wire), "repeated PCM frame reaches reader"))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+        if (!Check(AwaitReader(reader, received, 1000U) == PipeResult::Success, "reader completes a repeated PCM frame"))
+        {
+            reader.CancelAndDrain();
+            return;
+        }
+        Check(received.m_header.m_sequence == sequence && received.m_payload == inbound.m_payload, "reused reader output preserves each frame");
+        payloadBuffers[static_cast<std::size_t>(index)] = received.m_payload.data();
+    }
+
+    Check(payloadBuffers[0U] == payloadBuffers[2U], "reader alternates back to the first bounded payload allocation");
+    Check(payloadBuffers[1U] == payloadBuffers[3U], "reader alternates back to the second bounded payload allocation");
+    Check(received.m_payload.capacity() <= c_maxPayloadBytes, "reader never adopts output capacity above the protocol payload bound");
+
+    received.m_payload.reserve(c_maxPayloadBytes + 64U);
+    Check(received.m_payload.capacity() > c_maxPayloadBytes, "test output holds an oversized caller buffer");
+    const Message finalInbound = MakePcmMessage(64U, 64U, 0xCCU);
+    std::vector<std::uint8_t> finalWire;
+    if (!Check(Encode(finalInbound, finalWire), "final bounded PCM frame encodes") ||
+        !Check(reader.Begin(server.Get(), 1000U) == PipeResult::Pending, "reader begins after oversized output storage is supplied") ||
+        !Check(WriteAll(client.Get(), finalWire), "final bounded PCM frame reaches reader") ||
+        !Check(AwaitReader(reader, received, 1000U) == PipeResult::Success, "reader completes after oversized output storage is supplied"))
+    {
+        reader.CancelAndDrain();
+        return;
+    }
+    Check(received.m_payload == finalInbound.m_payload, "oversized output fallback still delivers the exact payload");
+    Check(received.m_payload.capacity() <= c_maxPayloadBytes, "reader declines to retain oversized caller capacity");
+}
+
+void TestPreparedWriterExactWireOwnershipAndBufferReuse()
+{
+    OwnedHandle server;
+    OwnedHandle client;
+    Check(CreatePipePair(server, client), "pipe pair opens for prepared writer ownership test");
+    if (!server || !client)
+    {
+        return;
+    }
+
+    AsyncPipeMessageWriter writer;
+    const Message expectedFirst = MakePcmMessage(71U, 1920U, 0x37U);
+    std::vector<std::uint8_t> expectedFirstWire;
+    if (!Check(Encode(expectedFirst, expectedFirstWire), "expected first PCM wire frame encodes"))
+    {
+        return;
+    }
+
+    const std::uint8_t* firstAllocation = nullptr;
+    {
+        OwnedWireMessage frame{};
+        Error validationError = Error::None;
+        if (!Check(PreparePcmWire(frame, 71U, 4096U, 1920U, 0x37U), "first PCM payload is written directly after the reserved header") ||
+            !Check(ValidateWireMessage(frame.m_bytes.data(), frame.m_bytes.size(), validationError), "prepared frame validates before transfer"))
+        {
+            return;
+        }
+        firstAllocation = frame.m_bytes.data();
+        if (!Check(writer.BeginPrepared(server.Get(), 1000U, frame) == PipeResult::Pending, "prepared frame transfers to the async writer"))
+        {
+            return;
+        }
+        Check(frame.m_bytes.empty(), "writer takes the complete framed allocation without retaining the caller object");
+        frame.m_bytes.assign(128U, 0xE7U);
+        Check(frame.m_bytes.size() == 128U, "caller can mutate its returned spare while the write is pending");
+    }
+
+    std::vector<std::uint8_t> receivedWire;
+    if (!Check(ReadAll(client.Get(), expectedFirstWire.size(), receivedWire), "client receives the owned prepared wire frame") ||
+        !Check(receivedWire == expectedFirstWire, "owned prepared writer emits byte-for-byte canonical framing") ||
+        !Check(AwaitWriter(writer, 1000U) == PipeResult::Success, "prepared writer reports completion after the input object was destroyed"))
+    {
+        writer.CancelAndDrain();
+        return;
+    }
+
+    const Message expectedSecond = MakePcmMessage(72U, 640U, 0xA1U);
+    std::vector<std::uint8_t> expectedSecondWire;
+    if (!Check(Encode(expectedSecond, expectedSecondWire), "expected second PCM wire frame encodes"))
+    {
+        return;
+    }
+    OwnedWireMessage second{};
+    if (!Check(PreparePcmWire(second, 72U, 640U, 640U, 0xA1U), "second PCM payload is prepared"))
+    {
+        return;
+    }
+    const std::uint8_t* secondAllocation = second.m_bytes.data();
+    if (!Check(writer.BeginPrepared(server.Get(), 1000U, second) == PipeResult::Pending, "writer returns its prior frame allocation while taking the next message"))
+    {
+        return;
+    }
+    Check(second.m_bytes.empty(), "writer clears the returned spare frame before returning it");
+    Check(second.m_bytes.data() == firstAllocation, "the original wire allocation returns by identity instead of being copied");
+    Check(second.m_bytes.capacity() >= expectedFirstWire.size(), "the returned wire allocation retains bounded reusable capacity");
+    second.m_bytes.assign(96U, 0xE7U);
+    Check(second.m_bytes.size() == 96U, "mutating a returned spare does not alter the in-flight writer allocation");
+
+    if (!Check(ReadAll(client.Get(), expectedSecondWire.size(), receivedWire), "client receives the reused writer frame") ||
+        !Check(receivedWire == expectedSecondWire, "reused prepared writer emits only the next frame") ||
+        !Check(AwaitWriter(writer, 1000U) == PipeResult::Success, "reused prepared writer completes the next frame"))
+    {
+        writer.CancelAndDrain();
+        return;
+    }
+
+    const Message expectedThird = MakePcmMessage(73U, 3000U, 0x77U);
+    std::vector<std::uint8_t> expectedThirdWire;
+    if (!Check(Encode(expectedThird, expectedThirdWire), "expected third PCM wire frame encodes") ||
+        !Check(PreparePcmWire(second, 73U, 3000U, 3000U, 0x77U), "producer prepares a later frame in the returned allocation") ||
+        !Check(second.m_bytes.data() == firstAllocation, "producer reuses the original allocation without reallocating") ||
+        !Check(writer.BeginPrepared(server.Get(), 1000U, second) == PipeResult::Pending, "writer takes the re-prepared frame allocation"))
+    {
+        writer.CancelAndDrain();
+        return;
+    }
+    Check(second.m_bytes.empty() && second.m_bytes.data() == secondAllocation, "writer returns its previous allocation for another reuse cycle");
+    if (!Check(ReadAll(client.Get(), expectedThirdWire.size(), receivedWire), "client receives the third recycled wire frame") ||
+        !Check(receivedWire == expectedThirdWire, "recycled allocation emits exact new frame bytes") ||
+        !Check(AwaitWriter(writer, 1000U) == PipeResult::Success, "writer completes the recycled frame"))
+    {
+        writer.CancelAndDrain();
+    }
+}
+
+void TestPreparedWriterHandlesPipeBackpressureAndMalformedInput()
+{
+    OwnedHandle server;
+    OwnedHandle client;
+    Check(CreatePipePair(server, client, 64U), "small-buffer pipe pair opens for maximum prepared frame backpressure test");
+    if (!server || !client)
+    {
+        return;
+    }
+
+    AsyncPipeMessageWriter writer;
+    const Message expectedMaximum = MakePcmMessage(81U, c_maxPayloadBytes, 0x4BU);
+    std::vector<std::uint8_t> expectedMaximumWire;
+    OwnedWireMessage maximum{};
+    if (!Check(Encode(expectedMaximum, expectedMaximumWire), "maximum expected PCM wire frame encodes") ||
+        !Check(PreparePcmWire(maximum, 81U, c_maxPayloadBytes, c_maxPayloadBytes, 0x4BU), "maximum PCM payload is prepared in bounded storage") ||
+        !Check(writer.BeginPrepared(server.Get(), 5000U, maximum) == PipeResult::Pending, "maximum prepared frame starts across a smaller named-pipe buffer"))
+    {
+        writer.CancelAndDrain();
+        return;
+    }
+
+    Check(maximum.m_bytes.empty(), "maximum prepared buffer transfers to the writer while bytes are in flight");
+    std::vector<std::uint8_t> receivedHeader;
+    if (!Check(ReadAll(client.Get(), c_headerBytes, receivedHeader), "client reads the header while the maximum write is backpressured") ||
+        !Check(std::equal(receivedHeader.begin(), receivedHeader.end(), expectedMaximumWire.begin()), "backpressured write starts with the exact wire header") ||
+        !Check(writer.Advance() == PipeResult::Pending, "writer remains pending after only the header prefix is drained"))
+    {
+        writer.CancelAndDrain();
+        return;
+    }
+
+    std::vector<std::uint8_t> receivedPayload;
+    if (!Check(ReadAll(client.Get(), expectedMaximumWire.size() - c_headerBytes, receivedPayload), "client drains the remaining payload through pipe backpressure") ||
+        !Check(std::equal(receivedPayload.begin(), receivedPayload.end(), expectedMaximumWire.begin() + static_cast<std::ptrdiff_t>(c_headerBytes)), "backpressured prepared write preserves every payload byte") ||
+        !Check(AwaitWriter(writer, 5000U) == PipeResult::Success, "writer completes after the pipe buffer is drained"))
+    {
+        writer.CancelAndDrain();
+        return;
+    }
+
+    OwnedWireMessage malformed{};
+    if (!Check(PreparePcmWire(malformed, 82U, 64U, 64U, 0x22U), "malformed frame starts from a valid prepared message"))
+    {
+        return;
+    }
+    malformed.m_bytes.push_back(0U);
+    const std::vector<std::uint8_t> originalMalformed = malformed.m_bytes;
+    Check(writer.BeginPrepared(server.Get(), 1000U, malformed) == PipeResult::InvalidMessage, "prepared writer rejects trailing bytes before taking ownership");
+    Check(malformed.m_bytes == originalMalformed, "malformed input remains byte-for-byte unchanged");
+}
+
+void TestPreparedWriterCancellationDrainsBeforeBufferReuse()
+{
+    OwnedHandle server;
+    OwnedHandle client;
+    Check(CreatePipePair(server, client), "pipe pair opens for prepared writer cancellation test");
+    if (!server || !client)
+    {
+        return;
+    }
+
+    AsyncPipeMessageWriter writer;
+    OwnedWireMessage large{};
+    if (!Check(PreparePcmWire(large, 91U, c_maxPayloadBytes, c_maxPayloadBytes, 0x5CU), "large cancellation frame is prepared"))
+    {
+        return;
+    }
+    const std::uint8_t* largeAllocation = large.m_bytes.data();
+    if (!Check(writer.BeginPrepared(server.Get(), 10000U, large) == PipeResult::Pending, "large prepared write becomes pending against an unread pipe"))
+    {
+        return;
+    }
+    Check(large.m_bytes.empty(), "writer owns the in-flight buffer before cancellation");
+    large.m_bytes.assign(64U, 0xEFU);
+    writer.CancelAndDrain();
+    Check(writer.Advance() == PipeResult::IoError, "cancelled prepared writer returns to idle after draining");
+
+    server.Reset();
+    client.Reset();
+    OwnedHandle freshServer;
+    OwnedHandle freshClient;
+    Check(CreatePipePair(freshServer, freshClient), "fresh pipe pair opens after prepared write cancellation");
+    if (!freshServer || !freshClient)
+    {
+        return;
+    }
+
+    OwnedWireMessage recovery{};
+    if (!Check(PreparePcmWire(recovery, 92U, 256U, 256U, 0xC3U), "small recovery frame is prepared") ||
+        !Check(writer.BeginPrepared(freshServer.Get(), 1000U, recovery) == PipeResult::Pending, "writer safely reuses storage after cancel and drain"))
+    {
+        writer.CancelAndDrain();
+        return;
+    }
+    Check(recovery.m_bytes.empty() && recovery.m_bytes.data() == largeAllocation, "cancelled large allocation returns to the next caller after drain");
+    Check(recovery.m_bytes.capacity() >= c_headerBytes + c_maxPayloadBytes, "cancelled buffer retains only protocol-bounded capacity");
+
+    const Message expected = MakePcmMessage(92U, 256U, 0xC3U);
+    std::vector<std::uint8_t> expectedWire;
+    std::vector<std::uint8_t> receivedWire;
+    if (!Check(Encode(expected, expectedWire), "recovery expected frame encodes") ||
+        !Check(ReadAll(freshClient.Get(), expectedWire.size(), receivedWire), "fresh client receives the post-cancel frame") ||
+        !Check(receivedWire == expectedWire, "post-cancel reuse writes the exact new frame") ||
+        !Check(AwaitWriter(writer, 1000U) == PipeResult::Success, "post-cancel writer completes successfully"))
+    {
+        writer.CancelAndDrain();
+    }
+}
+
 void TestCancellationAndWriterTimeoutRecovery()
 {
     OwnedHandle server;
@@ -569,6 +867,10 @@ int main()
     TestIdleReaderPartialTimeoutAndRecovery();
     TestInvalidHeaderBeforePayloadAndOutPreservation();
     TestConcurrentReadWriteAndBufferReuse();
+    TestReaderRecyclesPayloadBuffersAcrossFourMessages();
+    TestPreparedWriterExactWireOwnershipAndBufferReuse();
+    TestPreparedWriterHandlesPipeBackpressureAndMalformedInput();
+    TestPreparedWriterCancellationDrainsBeforeBufferReuse();
     TestCancellationAndWriterTimeoutRecovery();
 
     if (failures != 0)

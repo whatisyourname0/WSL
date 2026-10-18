@@ -59,6 +59,28 @@ class IAudioWorkerMessageEmitter
 public:
     virtual ~IAudioWorkerMessageEmitter() = default;
     virtual bool Emit(const audio_ipc::Message& message) noexcept = 0;
+
+    // Accepts a fully framed bounded message. Implementations may exchange a
+    // reusable wire buffer with the caller on success. The default keeps older
+    // emitters source-compatible and decodes into the existing bounded-copy
+    // path. A false result must leave the supplied frame unchanged.
+    virtual bool EmitPrepared(audio_ipc::OwnedWireMessage& message) noexcept
+    {
+        try
+        {
+            audio_ipc::Message decoded;
+            audio_ipc::Error error = audio_ipc::Error::None;
+            if (!audio_ipc::DecodeMessage(message.m_bytes.data(), message.m_bytes.size(), decoded, error))
+            {
+                return false;
+            }
+            return Emit(decoded);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
 };
 
 // A single-threaded worker-process session adapter. Call HandleControl,
@@ -113,6 +135,7 @@ private:
     AudioWorkerFaultCode MapCaptureError(CaptureErrorCode code) const noexcept;
 
     AudioCaptureWorker m_worker;
+    audio_ipc::OwnedWireMessage m_pcmOutput;
     AudioWorkerSessionState m_state{AudioWorkerSessionState::AwaitingHello};
     std::uint64_t m_lastInboundSequence{};
     std::uint64_t m_lastOutboundSequence{};

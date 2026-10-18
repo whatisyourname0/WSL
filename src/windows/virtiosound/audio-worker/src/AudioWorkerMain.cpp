@@ -5,12 +5,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <deque>
 #include <limits>
 #include <string>
 #include <utility>
 
 #include "AudioWorkerSession.hpp"
+#include "BoundedPipeEmitter.hpp"
 #include "AudioPipeTransport.hpp"
 #include "windows/ServerIdentityValidation.hpp"
 
@@ -18,64 +18,20 @@ namespace {
 
 using wsl::virtio_sound::audio_ipc::Message;
 using wsl::virtio_sound::audio_ipc::windows::PipeResult;
+using wsl::virtio_sound::audio_worker::BoundedPipeEmitter;
 using wsl::virtio_sound::audio_worker::AudioWorkerPollResult;
 using wsl::virtio_sound::audio_worker::AudioWorkerSession;
 using wsl::virtio_sound::audio_worker::AudioWorkerSessionState;
-using wsl::virtio_sound::audio_worker::IAudioWorkerMessageEmitter;
 
 constexpr DWORD c_pipeConnectTimeoutMs = 5000U;
 constexpr DWORD c_messageTimeoutMs = 1000U;
 constexpr std::size_t c_maximumPipePathCodeUnits = 256U;
-constexpr std::size_t c_maximumQueuedMessages = 2U;
+constexpr std::size_t c_maximumQueuedMessages = BoundedPipeEmitter::c_maximumQueuedMessages;
 
 bool IsTerminal(AudioWorkerSessionState state) noexcept
 {
     return state == AudioWorkerSessionState::Closed || state == AudioWorkerSessionState::Faulted || state == AudioWorkerSessionState::Disconnected;
 }
-
-class PipeEmitter final : public IAudioWorkerMessageEmitter
-{
-public:
-    bool Emit(const Message& message) noexcept override
-    {
-        if (m_messages.size() >= c_maximumQueuedMessages)
-        {
-            return false;
-        }
-        try
-        {
-            m_messages.push_back(message);
-            return true;
-        }
-        catch (...)
-        {
-            return false;
-        }
-    }
-
-    bool Empty() const noexcept
-    {
-        return m_messages.empty();
-    }
-
-    std::size_t Size() const noexcept
-    {
-        return m_messages.size();
-    }
-
-    const Message& Front() const noexcept
-    {
-        return m_messages.front();
-    }
-
-    void PopFront() noexcept
-    {
-        m_messages.pop_front();
-    }
-
-private:
-    std::deque<Message> m_messages;
-};
 
 bool ValidatePipeArgument(const wchar_t* value, std::wstring& path)
 {
@@ -268,7 +224,7 @@ int RunSession(HANDLE pipe, HANDLE stopEvent, HANDLE authenticatedServerProcess)
         return 69;
     }
     AudioWorkerSession session;
-    PipeEmitter emitter;
+    BoundedPipeEmitter emitter;
     wsl::virtio_sound::audio_ipc::windows::PipeMessageReader reader;
     wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter writer;
     bool readerActive = false;
@@ -288,7 +244,7 @@ int RunSession(HANDLE pipe, HANDLE stopEvent, HANDLE authenticatedServerProcess)
         {
             return true;
         }
-        const PipeResult result = writer.Begin(pipe, c_messageTimeoutMs, emitter.Front());
+        const PipeResult result = writer.BeginPrepared(pipe, c_messageTimeoutMs, emitter.Front());
         if (result != PipeResult::Pending)
         {
             return false;

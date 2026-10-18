@@ -651,7 +651,19 @@ PipeResult PipeMessageReader::Deliver(Message& out) noexcept
     if (result == PipeResult::Success)
     {
         out.m_header = m_header;
-        out.m_payload = std::move(m_payload);
+        if (out.m_payload.capacity() <= c_maxPayloadBytes)
+        {
+            // Return only bounded storage to the reader. Keep the caller's
+            // capacity for the next message and clear its logical contents.
+            out.m_payload.swap(m_payload);
+            m_payload.clear();
+        }
+        else
+        {
+            // Do not let an arbitrary caller capacity inflate the reader's
+            // retained buffer beyond the protocol's payload bound.
+            out.m_payload = std::move(m_payload);
+        }
     }
     m_state = State::Idle;
     m_result = PipeResult::IoError;
@@ -814,6 +826,48 @@ PipeResult AsyncPipeMessageWriter::Begin(HANDLE pipe, DWORD timeoutMs, const Mes
         m_state = State::Idle;
         m_pipe = nullptr;
     }
+    return result;
+}
+
+PipeResult AsyncPipeMessageWriter::BeginPrepared(HANDLE pipe, DWORD timeoutMs, OwnedWireMessage& message) noexcept
+{
+    if (m_state != State::Idle || pipe == nullptr || pipe == INVALID_HANDLE_VALUE || timeoutMs == INFINITE)
+    {
+        return PipeResult::IoError;
+    }
+
+    Error codecError = Error::None;
+    if (!ValidateWireMessage(message.m_bytes.data(), message.m_bytes.size(), codecError))
+    {
+        return PipeResult::InvalidMessage;
+    }
+    if (!EnsureManualResetEvent(m_operationEvent) || ResetEvent(m_operationEvent) == FALSE)
+    {
+        return PipeResult::IoError;
+    }
+
+    // The producer already owns one contiguous header + payload frame. Swap
+    // its allocation into the writer rather than making a second wire copy.
+    m_wire.swap(message.m_bytes);
+    m_pipe = pipe;
+    m_deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
+    m_wireBytesWritten = 0U;
+    m_state = State::Writing;
+
+    const PipeResult result = IssueWrite();
+    if (result != PipeResult::Pending)
+    {
+        m_state = State::Idle;
+        m_pipe = nullptr;
+        m_requestedBytes = 0U;
+        m_wireBytesWritten = 0U;
+        m_wire.swap(message.m_bytes);
+        return result;
+    }
+
+    // The returned spare may contain an earlier PCM frame. Clear its logical
+    // length before it returns to the caller while retaining its capacity.
+    message.m_bytes.clear();
     return result;
 }
 

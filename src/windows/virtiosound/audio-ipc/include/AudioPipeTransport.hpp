@@ -42,7 +42,8 @@ enum class PipeResult
 // operation completes or CancelAndDrain returns. Advance reports a completed
 // message once. CancelAndDrain cancels, drains, and returns the reader to Idle;
 // discard that pipe because part of a frame may already have been read. A
-// timeout is also terminal for its pipe. Calls on an instance must be
+// timeout is also terminal for its pipe. Successful delivery reuses a bounded
+// prior output payload buffer on the next frame. Calls on an instance must be
 // serialized. A single read and one write may run concurrently on a pipe.
 class PipeMessageReader final
 {
@@ -97,6 +98,12 @@ private:
 
 // Stateful overlapped writer for one message at a time. Begin validates and
 // encodes into storage owned by this object before issuing the first write.
+// BeginPrepared accepts an already-framed owned buffer and transfers its
+// storage into the writer after exact wire validation, avoiding a second
+// full-message encoding buffer for PCM. It returns the writer's previous
+// cleared buffer through the supplied message for reuse. The writer keeps the
+// transferred bytes alive through completion or cancellation drain. Framing
+// and validation are unchanged; the kernel still copies bytes into the pipe.
 // Advance is nonblocking (apart from draining an expired/cancelled request).
 // The pipe handle is borrowed and must remain valid until the operation
 // completes or CancelAndDrain returns. Advance reports a completed write once.
@@ -115,6 +122,7 @@ public:
     AsyncPipeMessageWriter& operator=(AsyncPipeMessageWriter&&) = delete;
 
     PipeResult Begin(HANDLE pipe, DWORD timeoutMs, const Message& message) noexcept;
+    PipeResult BeginPrepared(HANDLE pipe, DWORD timeoutMs, OwnedWireMessage& message) noexcept;
     PipeResult Advance() noexcept;
     HANDLE Event() const noexcept;
     DWORD WaitTimeoutMilliseconds() const noexcept;

@@ -1337,6 +1337,9 @@ private:
 
         wsl::virtio_sound::audio_ipc::windows::PipeMessageReader reader;
         wsl::virtio_sound::audio_ipc::windows::AsyncPipeMessageWriter writer;
+        // Keep the decoded payload alive between deliveries so the reader can
+        // exchange bounded storage instead of allocating for every PCM frame.
+        Message incoming{};
         AsyncPipeDrainOnExit drainOnExit(reader, writer);
         (void)drainOnExit;
         bool readerActive = false;
@@ -1480,13 +1483,12 @@ private:
                     }
                     readerActive = true;
                 }
-                Message finalMessage{};
-                const PipeResult result = reader.Advance(finalMessage);
+                const PipeResult result = reader.Advance(incoming);
                 if (result == PipeResult::Success)
                 {
                     readerActive = false;
-                    recordInbound(finalMessage);
-                    if (!HandleInbound(finalMessage, phase, activeEpoch, activeGeneration, lastInboundSequence))
+                    recordInbound(incoming);
+                    if (!HandleInbound(incoming, phase, activeEpoch, activeGeneration, lastInboundSequence))
                     {
                         return false;
                     }
@@ -1619,7 +1621,6 @@ private:
                 readerActive = true;
             }
 
-            Message incoming{};
             const PipeResult readResult = reader.Advance(incoming);
             if (readResult == PipeResult::Success)
             {
