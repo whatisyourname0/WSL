@@ -87,8 +87,9 @@ bool ValidateMessage(const Message& message, Error& error) noexcept;
 // truncated and trailing bytes are rejected. `out` is unchanged on failure.
 bool DecodeMessage(const std::uint8_t* data, std::size_t size, Message& out, Error& error);
 
-// Encode one validated message to its exact wire representation. `out` is
-// unchanged on failure.
+// Encode one validated message to its exact wire representation. Existing
+// capacity in `out` is reused. `out` is unchanged on validation or allocation
+// failure.
 bool EncodeMessage(const Message& message, std::vector<std::uint8_t>& out, Error& error);
 
 // Build or parse Start's fixed-format payload. Endpoint IDs use UTF-16 code

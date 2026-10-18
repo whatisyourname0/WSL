@@ -103,6 +103,19 @@ struct DiagnosticSnapshot
     std::uint64_t m_interruptApiRequests{};
     std::uint64_t m_interruptApiSuccesses{};
     std::uint64_t m_interruptApiFailures{};
+    // Lifetime capture aggregates. These contain counts and high-water marks,
+    // never PCM samples or per-period records.
+    std::uint64_t m_capturePumpCalls{};
+    std::uint64_t m_capturePumpRequestedFrames{};
+    std::uint64_t m_capturePumpCompletedFrames{};
+    std::uint64_t m_capturePumpNoProgressCalls{};
+    std::uint64_t m_captureElapsedPumpCalls{};
+    std::uint64_t m_captureElapsedNanoseconds{};
+    std::uint64_t m_captureMaximumElapsedNanoseconds{};
+    std::uint16_t m_captureMaximumRxOutstandingAvailable{};
+    std::uint32_t m_captureMaximumSourceAvailableFrames{};
+    std::uint64_t m_captureScratchCapacityGrowths{};
+    std::size_t m_captureScratchCapacityBytes{};
 };
 
 class VirtioSoundDevice final

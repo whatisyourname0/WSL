@@ -86,6 +86,18 @@ namespace {
         }
     }
 
+    void Accumulate(std::uint64_t& value, std::uint64_t amount) noexcept
+    {
+        if (std::numeric_limits<std::uint64_t>::max() - value < amount)
+        {
+            value = std::numeric_limits<std::uint64_t>::max();
+        }
+        else
+        {
+            value += amount;
+        }
+    }
+
     int RateIndex(std::uint32_t sampleRate)
     {
         constexpr std::array<std::uint32_t, 14> c_rates{
@@ -122,6 +134,14 @@ public:
         if (!m_pcmSource && (m_format.m_channels != 2 || m_format.m_sampleRate != 48000))
         {
             throw std::invalid_argument("A PCM source is required for non-default formats");
+        }
+
+        // The guest transport bounds each PCM payload to this size. Allocate
+        // the reusable scratch once so steady-state periods do not allocate.
+        m_pcmScratch.resize(c_maxPcmPayloadBytes);
+        if (m_pcmScratch.capacity() != 0)
+        {
+            Increment(m_captureScratchCapacityGrowths);
         }
 
         WriteLe(m_pci.data(), 0, VirtioSoundDevice::c_vendorId, 2);
@@ -202,6 +222,7 @@ public:
     PcmFormat m_format;
     int m_rateIndex{};
     std::uint32_t m_frameBytes{};
+    std::vector<std::uint8_t> m_pcmScratch;
     // This portable core uses the standard lock types so its standalone CMake target stays WIL-free.
     mutable std::recursive_mutex m_gate;
     std::array<std::uint8_t, 256> m_pci{};
@@ -226,6 +247,16 @@ public:
     std::uint64_t m_interruptApiRequests{};
     std::uint64_t m_interruptApiSuccesses{};
     std::uint64_t m_interruptApiFailures{};
+    std::uint64_t m_capturePumpCalls{};
+    std::uint64_t m_capturePumpRequestedFrames{};
+    std::uint64_t m_capturePumpCompletedFrames{};
+    std::uint64_t m_capturePumpNoProgressCalls{};
+    std::uint64_t m_captureElapsedPumpCalls{};
+    std::uint64_t m_captureElapsedNanoseconds{};
+    std::uint64_t m_captureMaximumElapsedNanoseconds{};
+    std::uint16_t m_captureMaximumRxOutstandingAvailable{};
+    std::uint32_t m_captureMaximumSourceAvailableFrames{};
+    std::uint64_t m_captureScratchCapacityGrowths{};
     std::uint16_t m_queueSelect{};
     std::uint16_t m_configVector{0xffff};
     std::uint8_t m_status{};
@@ -1120,6 +1151,20 @@ public:
         Complete(m_queues[3], chain, 8, false, true);
     }
 
+    void ObserveRxBacklog() noexcept
+    {
+        const std::uint16_t outstanding = static_cast<std::uint16_t>(m_queues[3].m_observedAvailable - m_queues[3].m_lastAvailable);
+        m_captureMaximumRxOutstandingAvailable = (std::max)(m_captureMaximumRxOutstandingAvailable, outstanding);
+    }
+
+    void ObserveSourceBacklog(const std::optional<std::uint32_t>& availableFrames) noexcept
+    {
+        if (availableFrames.has_value())
+        {
+            m_captureMaximumSourceAvailableFrames = (std::max)(m_captureMaximumSourceAvailableFrames, *availableFrames);
+        }
+    }
+
     int PumpCapture(int frameBudget)
     {
         if (frameBudget < 0 || frameBudget > static_cast<int>(c_maxTransferBytes / m_frameBytes))
@@ -1127,6 +1172,28 @@ public:
             throw std::out_of_range("Capture frame budget is outside the bounded transfer size");
         }
         std::lock_guard<std::recursive_mutex> lock(m_gate);
+        Increment(m_capturePumpCalls);
+        Accumulate(m_capturePumpRequestedFrames, static_cast<std::uint64_t>(frameBudget));
+        int completed = 0;
+        try
+        {
+            completed = PumpCaptureCore(frameBudget);
+        }
+        catch (...)
+        {
+            Increment(m_capturePumpNoProgressCalls);
+            throw;
+        }
+        Accumulate(m_capturePumpCompletedFrames, static_cast<std::uint64_t>(completed));
+        if (completed == 0)
+        {
+            Increment(m_capturePumpNoProgressCalls);
+        }
+        return completed;
+    }
+
+    int PumpCaptureCore(int frameBudget)
+    {
         if (!Ready() || !IsRunning())
         {
             return 0;
@@ -1160,7 +1227,9 @@ public:
                 for (int n = 0; n < c_maxQueueSize; ++n)
                 {
                     Chain chain;
-                    if (PeekRx(chain) == nullptr)
+                    Chain* available = PeekRx(chain);
+                    ObserveRxBacklog();
+                    if (available == nullptr)
                     {
                         break;
                     }
@@ -1192,6 +1261,7 @@ public:
         if (m_pcmSource)
         {
             const std::optional<std::uint32_t> availableFrames = m_pcmSource->AvailableFrames();
+            ObserveSourceBacklog(availableFrames);
             if (availableFrames.has_value())
             {
                 const std::uint32_t maximumFrames = VirtioSoundDevice::c_maxTransferBytes / m_frameBytes;
@@ -1205,7 +1275,9 @@ public:
             for (int n = 0; n < c_maxQueueSize; ++n)
             {
                 Chain chain;
-                if (PeekRx(chain) == nullptr)
+                Chain* available = PeekRx(chain);
+                ObserveRxBacklog();
+                if (available == nullptr)
                 {
                     break;
                 }
@@ -1226,11 +1298,10 @@ public:
                     m_pendingRx = chain;
                     break;
                 }
-                std::vector<std::uint8_t> payload(payloadLength);
                 bool generated = false;
                 try
                 {
-                    generated = GenerateFrames(needed, payload.data(), payload.size());
+                    generated = GenerateFrames(needed, m_pcmScratch.data(), payloadLength);
                 }
                 catch (...)
                 {
@@ -1243,7 +1314,7 @@ public:
                     LatchXrun();
                     continue;
                 }
-                Scatter(chain, 0, payload.data(), payload.size());
+                Scatter(chain, 0, m_pcmScratch.data(), payloadLength);
                 std::array<std::uint8_t, 8> tail{};
                 WriteLe(tail.data(), 0, c_statusOk, 4); // latency is not supplied by this source API
                 Scatter(chain, payloadLength, tail.data(), tail.size());
@@ -1261,6 +1332,9 @@ public:
     int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds)
     {
         std::lock_guard<std::recursive_mutex> lock(m_gate);
+        Increment(m_captureElapsedPumpCalls);
+        Accumulate(m_captureElapsedNanoseconds, elapsedNanoseconds);
+        m_captureMaximumElapsedNanoseconds = (std::max)(m_captureMaximumElapsedNanoseconds, elapsedNanoseconds);
         if (m_pendingStartControl.has_value())
         {
             try
@@ -1317,6 +1391,7 @@ public:
         if (m_pcmSource)
         {
             const std::optional<std::uint32_t> availableFrames = m_pcmSource->AvailableFrames();
+            ObserveSourceBacklog(availableFrames);
             if (availableFrames.has_value())
             {
                 // The source queue already advances on its capture clock.
@@ -1537,6 +1612,17 @@ public:
         snapshot.m_interruptApiRequests = m_interruptApiRequests;
         snapshot.m_interruptApiSuccesses = m_interruptApiSuccesses;
         snapshot.m_interruptApiFailures = m_interruptApiFailures;
+        snapshot.m_capturePumpCalls = m_capturePumpCalls;
+        snapshot.m_capturePumpRequestedFrames = m_capturePumpRequestedFrames;
+        snapshot.m_capturePumpCompletedFrames = m_capturePumpCompletedFrames;
+        snapshot.m_capturePumpNoProgressCalls = m_capturePumpNoProgressCalls;
+        snapshot.m_captureElapsedPumpCalls = m_captureElapsedPumpCalls;
+        snapshot.m_captureElapsedNanoseconds = m_captureElapsedNanoseconds;
+        snapshot.m_captureMaximumElapsedNanoseconds = m_captureMaximumElapsedNanoseconds;
+        snapshot.m_captureMaximumRxOutstandingAvailable = m_captureMaximumRxOutstandingAvailable;
+        snapshot.m_captureMaximumSourceAvailableFrames = m_captureMaximumSourceAvailableFrames;
+        snapshot.m_captureScratchCapacityGrowths = m_captureScratchCapacityGrowths;
+        snapshot.m_captureScratchCapacityBytes = m_pcmScratch.capacity();
         return snapshot;
     }
 };

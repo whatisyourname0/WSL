@@ -432,10 +432,39 @@ bool EncodeMessage(const Message& message, std::vector<std::uint8_t>& out, Error
     }
 
     const std::size_t totalSize = c_headerBytes + message.m_payload.size();
-    std::vector<std::uint8_t> encoded;
+    if (&out == &message.m_payload)
+    {
+        // Preserve the historical behavior when callers choose the message's
+        // own payload vector as the output destination. The header overwrites
+        // bytes that are still needed as the source payload, so this uncommon
+        // alias case requires a temporary buffer.
+        std::vector<std::uint8_t> encoded;
+        try
+        {
+            encoded.resize(totalSize);
+        }
+        catch (const std::bad_alloc&)
+        {
+            error = Error::AllocationFailure;
+            return false;
+        }
+
+        WriteHeader(message.m_header, encoded.data());
+        if (!message.m_payload.empty())
+        {
+            std::copy(message.m_payload.begin(), message.m_payload.end(), encoded.begin() + static_cast<std::ptrdiff_t>(c_headerBytes));
+        }
+        out.swap(encoded);
+        error = Error::None;
+        return true;
+    }
+
     try
     {
-        encoded.resize(totalSize);
+        // Resize the caller-owned buffer in place. For a session that emits
+        // repeated messages up to a stable maximum size, capacity is retained
+        // after the first growth and no further wire-buffer allocation occurs.
+        out.resize(totalSize);
     }
     catch (const std::bad_alloc&)
     {
@@ -443,12 +472,11 @@ bool EncodeMessage(const Message& message, std::vector<std::uint8_t>& out, Error
         return false;
     }
 
-    WriteHeader(message.m_header, encoded.data());
+    WriteHeader(message.m_header, out.data());
     if (!message.m_payload.empty())
     {
-        std::copy(message.m_payload.begin(), message.m_payload.end(), encoded.begin() + static_cast<std::ptrdiff_t>(c_headerBytes));
+        std::copy(message.m_payload.begin(), message.m_payload.end(), out.begin() + static_cast<std::ptrdiff_t>(c_headerBytes));
     }
-    out.swap(encoded);
     error = Error::None;
     return true;
 }

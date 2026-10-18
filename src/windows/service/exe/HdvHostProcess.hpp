@@ -16,8 +16,10 @@
 #include <wil/resource.h>
 #include <wil/result.h>
 
+#include "CapturePumpScheduler.hpp"
 #include "HdvPciDeviceHost.hpp"
 #include "WindowsCaptureSource.hpp"
+#include "../../virtiosound/src/windows/AudioSourceTrace.hpp"
 
 namespace wsl::virtio_sound::process_host {
 constexpr std::uint32_t c_startupMagic = 0x48565341;
@@ -124,11 +126,27 @@ inline int Run(int argc, wchar_t** argv) noexcept
         THROW_HR_IF(E_FAIL, written != sizeof(packet));
         output.reset();
         using clock = std::chrono::steady_clock;
-        auto last = clock::now();
+        constexpr std::uint64_t c_nanosecondsPerMillisecond = 1'000'000;
+        constexpr std::uint64_t c_idlePumpIntervalNanoseconds =
+            static_cast<std::uint64_t>(native::VirtioSoundDevice::c_capturePumpIntervalMs) * c_nanosecondsPerMillisecond;
+        // Active capture uses half the legacy 10 ms compatibility interval to
+        // provide another service opportunity between 480-frame periods. Host
+        // scheduling jitter and long stalls can still increase source backlog.
+        constexpr std::uint64_t c_activePumpIntervalNanoseconds = c_idlePumpIntervalNanoseconds / 2;
+        const auto clockOrigin = clock::now();
+        auto lastPump = clockOrigin;
+        auto toNanoseconds = [&](clock::time_point time) {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(time - clockOrigin).count());
+        };
+        detail::CapturePumpScheduler scheduler(c_idlePumpIntervalNanoseconds, 0);
         const HANDLE waits[]{stop, parent};
         for (;;)
         {
-            const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, native::VirtioSoundDevice::c_capturePumpIntervalMs);
+            const auto beforeWait = clock::now();
+            const auto beforeWaitNanoseconds = toNanoseconds(beforeWait);
+            scheduler.SetInterval(
+                host->CaptureRunning() ? c_activePumpIntervalNanoseconds : c_idlePumpIntervalNanoseconds, beforeWaitNanoseconds);
+            const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, scheduler.WaitTimeoutMilliseconds(beforeWaitNanoseconds));
             if (wait == WAIT_OBJECT_0)
             {
                 // The parent signals stop only after confirming guest shutdown.
@@ -157,14 +175,20 @@ inline int Run(int argc, wchar_t** argv) noexcept
                 THROW_HR(E_UNEXPECTED);
             }
 
-            const auto now = clock::now();
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count();
-            last = now;
+            const auto pumpStarted = clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(pumpStarted - lastPump).count();
+            // Keep elapsed time measured across state changes. PumpCaptureElapsed
+            // owns START/STOP generation handling and discards stale credit.
+            lastPump = pumpStarted;
+            scheduler.PumpStarted(toNanoseconds(pumpStarted));
             if (elapsed > 0)
             {
                 host->PumpCaptureElapsed(static_cast<std::uint64_t>(elapsed));
             }
+            scheduler.PumpCompleted(toNanoseconds(clock::now()));
         }
+        native::windows::detail::TraceAudioSource(
+            L"CapturePumpSchedule", scheduler.LateTicks(), scheduler.SkippedDeadlines());
         // The parent confirms guest shutdown before signaling stop. Keep the
         // existing ownership rule: do not tear down another WSL proxy registration.
         (void)host->GuestStoppedAndRetire();

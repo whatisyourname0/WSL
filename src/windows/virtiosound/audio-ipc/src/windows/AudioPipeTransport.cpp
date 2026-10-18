@@ -278,7 +278,15 @@ PipeResult ReadMessage(HANDLE pipe, HANDLE stopEvent, DWORD timeoutMs, Message& 
     return PipeResult::Success;
 }
 
-PipeResult WriteMessage(HANDLE pipe, HANDLE stopEvent, DWORD timeoutMs, const Message& message) noexcept
+PipeMessageWriter::~PipeMessageWriter() noexcept
+{
+    if (m_operationEvent != nullptr)
+    {
+        CloseHandle(m_operationEvent);
+    }
+}
+
+PipeResult PipeMessageWriter::Write(HANDLE pipe, HANDLE stopEvent, DWORD timeoutMs, const Message& message) noexcept
 {
     if (timeoutMs == INFINITE || pipe == nullptr || pipe == INVALID_HANDLE_VALUE)
     {
@@ -291,10 +299,9 @@ PipeResult WriteMessage(HANDLE pipe, HANDLE stopEvent, DWORD timeoutMs, const Me
         return PipeResult::InvalidMessage;
     }
 
-    std::vector<std::uint8_t> wire;
     try
     {
-        if (!EncodeMessage(message, wire, codecError))
+        if (!EncodeMessage(message, m_wire, codecError))
         {
             return PipeResult::InvalidMessage;
         }
@@ -304,13 +311,23 @@ PipeResult WriteMessage(HANDLE pipe, HANDLE stopEvent, DWORD timeoutMs, const Me
         return PipeResult::IoError;
     }
 
-    wil::unique_event event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    if (!event)
+    if (m_operationEvent == nullptr)
     {
-        return PipeResult::IoError;
+        m_operationEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (m_operationEvent == nullptr)
+        {
+            return PipeResult::IoError;
+        }
     }
+
     const Deadline deadline(timeoutMs);
-    return WriteExact(pipe, stopEvent, deadline, event.get(), wire.data(), wire.size());
+    return WriteExact(pipe, stopEvent, deadline, m_operationEvent, m_wire.data(), m_wire.size());
+}
+
+PipeResult WriteMessage(HANDLE pipe, HANDLE stopEvent, DWORD timeoutMs, const Message& message) noexcept
+{
+    PipeMessageWriter writer;
+    return writer.Write(pipe, stopEvent, timeoutMs, message);
 }
 
 } // namespace wsl::virtio_sound::audio_ipc::windows

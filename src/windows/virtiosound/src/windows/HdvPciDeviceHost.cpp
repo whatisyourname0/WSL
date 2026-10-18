@@ -1229,6 +1229,22 @@ RetireOutcome HdvPciDeviceHost::GuestStoppedAndRetire() noexcept
     lock.unlock();
     const bool aperturesCleaned = state.FlushGuestMemoryAperturesForRetirement();
     TraceApertureSummary();
+    // Aggregate metadata only, emitted after callbacks and pumps are drained.
+    // Diagnostics must never change retirement or ownership decisions.
+    try
+    {
+        const auto capture = state.m_device->GetDiagnosticsSnapshot();
+        detail::TraceAudioSource(L"CapturePumpTotals", capture.m_capturePumpCalls, capture.m_capturePumpCompletedFrames);
+        detail::TraceAudioSource(L"CapturePumpEmpty", capture.m_capturePumpNoProgressCalls, capture.m_capturePumpRequestedFrames);
+        detail::TraceAudioSource(L"CaptureIntervals", capture.m_captureElapsedPumpCalls, capture.m_captureElapsedNanoseconds);
+        detail::TraceAudioSource(L"CaptureIntervalMax", capture.m_captureMaximumElapsedNanoseconds);
+        detail::TraceAudioSource(L"CaptureBacklogMax", capture.m_captureMaximumSourceAvailableFrames, capture.m_captureMaximumRxOutstandingAvailable);
+        detail::TraceAudioSource(L"CaptureScratch", capture.m_captureScratchCapacityGrowths, capture.m_captureScratchCapacityBytes);
+    }
+    catch (...)
+    {
+        // Continue retirement even if the diagnostic snapshot is unavailable.
+    }
     lock.lock();
     if (!aperturesCleaned)
     {

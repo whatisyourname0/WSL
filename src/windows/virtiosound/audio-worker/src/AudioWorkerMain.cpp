@@ -41,12 +41,13 @@ public:
 
     bool Emit(const Message& message) noexcept override
     {
-        return wsl::virtio_sound::audio_ipc::windows::WriteMessage(m_pipe, m_stopEvent, c_messageTimeoutMs, message) == PipeResult::Success;
+        return m_writer.Write(m_pipe, m_stopEvent, c_messageTimeoutMs, message) == PipeResult::Success;
     }
 
 private:
     HANDLE m_pipe;
     HANDLE m_stopEvent;
+    wsl::virtio_sound::audio_ipc::windows::PipeMessageWriter m_writer;
 };
 
 bool ValidatePipeArgument(const wchar_t* value, std::wstring& path)

@@ -116,8 +116,49 @@ validation of changed source. WSL package version numbers and the WSL1/WSL2
 architecture designation are separate version axes.
 
 Source-clocked capture rejects PCM buffer/period configurations that cannot
-sustain the nominal 10 ms host pump interval. The per-pump budget retains one
+sustain a conservative 10 ms service interval. The per-pump budget retains one
 guest period of headroom and must contain at least 10 ms of frames in complete
 periods. At 48 kHz, a 512-frame buffer with a 128-frame period is unsupported;
 a 1024-frame buffer with a 256-frame period satisfies this capacity check.
 This is a throughput constraint, not a guarantee against host scheduling stalls.
+
+## Capture scheduling and performance diagnostics
+
+The HDV child uses monotonic absolute deadlines: 5 ms while capture is running
+and 10 ms while idle. Processing time no longer starts a fresh full wait. Missed
+deadlines are skipped, without a burst of catch-up calls. Elapsed frame credit
+still uses the measured time between pump starts; source-clocked capture still
+depends on queued input frames. Stop and parent-exit handles retain priority.
+The shorter active interval increases wakeups and is not a hard timing guarantee.
+The conservative 10 ms configuration capacity check remains unchanged.
+
+`DiagnosticSnapshot` exposes device-lifetime saturating totals for pump calls,
+requested/completed frames, calls without a successful completion, elapsed call
+count and nanoseconds, maximum interval, and observed source/RX backlog. Scratch
+capacity and growth count show the retained allocation cost. These counters
+survive guest device reset and contain no PCM, endpoint identifiers, or per-period
+records. Backlog values are maxima observed at existing queue reads, not a full
+history of all arrivals. Averages must use matching counters: elapsed totals
+count all elapsed-pump calls, while frame totals count calls reaching the core
+pump, including direct test calls.
+
+After callbacks and pumps drain, guest retirement emits aggregate `CapturePump*`,
+`CaptureInterval*`, `CaptureBacklogMax`, and `CaptureScratch` events through the
+existing AudioSource ETW provider. Normal child shutdown additionally emits
+`CapturePumpSchedule`, with late ticks in `value` and skipped deadlines in `extra`.
+Forced process exit does not guarantee a summary. No per-period ETW event is
+added by this instrumentation.
+
+The core retains a maximum-sized PCM scratch vector (1 MiB minus 12 bytes of
+transport overhead) per device. The worker retains its validated IPC wire buffer
+and one overlapped event per writer. Both buffers can retain previous PCM in
+private process memory until overwritten or destroyed; diagnostics never export
+them. Pipe cancellation drains outstanding I/O before reuse. A failed write can
+leave a partial wire frame, so the pipe session must be discarded even though
+the writer's buffer and event can be reused with a fresh pipe.
+
+The [comparison benchmark](../../../src/windows/virtiosound/benchmarks/README.md)
+builds one harness against baseline and candidate core sources. Its allocation
+counts and the deterministic scheduler simulation do not measure microphone
+latency, host CPU consumption, or timer behavior under VM load. Validate those
+separately before claiming end-to-end performance gains.

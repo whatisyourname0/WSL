@@ -4,6 +4,17 @@ function(wsl_virtio_sound_enable_test_warnings target)
     endif()
 endfunction()
 
+add_executable(wsl_virtio_sound_pump_scheduler_tests
+    ../../service/exe/tests/CapturePumpSchedulerTests.cpp)
+target_compile_features(wsl_virtio_sound_pump_scheduler_tests PRIVATE cxx_std_17)
+wsl_virtio_sound_enable_test_warnings(wsl_virtio_sound_pump_scheduler_tests)
+add_test(NAME wsl_virtio_sound_pump_scheduler COMMAND wsl_virtio_sound_pump_scheduler_tests)
+
+add_executable(wsl_virtio_sound_diagnostics_tests VirtioSoundDeviceDiagnosticsTests.cpp)
+target_link_libraries(wsl_virtio_sound_diagnostics_tests PRIVATE wsl_virtio_sound)
+wsl_virtio_sound_enable_test_warnings(wsl_virtio_sound_diagnostics_tests)
+add_test(NAME wsl_virtio_sound_diagnostics COMMAND wsl_virtio_sound_diagnostics_tests)
+
 add_executable(wsl_virtio_sound_tests VirtioSoundDeviceTests.cpp)
 target_link_libraries(wsl_virtio_sound_tests PRIVATE wsl_virtio_sound)
 wsl_virtio_sound_enable_test_warnings(wsl_virtio_sound_tests)
