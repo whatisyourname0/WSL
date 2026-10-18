@@ -9,6 +9,8 @@
 #include <wil/com.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -24,6 +26,21 @@ namespace {
 
     constexpr DWORD c_knownCaptureFlags = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY | AUDCLNT_BUFFERFLAGS_SILENT | AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR;
     constexpr std::uint32_t c_maximumPacketBytes = MaximumCapturePacketFrames() * static_cast<std::uint32_t>(RequiredBytesPerFrame());
+    using CaptureClock = std::chrono::steady_clock;
+
+    std::uint64_t ElapsedMicroseconds(CaptureClock::time_point start, CaptureClock::time_point end) noexcept
+    {
+        if (end < start)
+        {
+            return 0;
+        }
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+    }
+
+    void UpdateMaximum(std::uint64_t& maximum, std::uint64_t value) noexcept
+    {
+        maximum = (std::max)(maximum, value);
+    }
 
     std::wstring HresultMessage(const wchar_t* operation, HRESULT result)
     {
@@ -185,6 +202,15 @@ namespace {
                 return false;
             }
 
+            // Retain the endpoint's actual engine buffer size as diagnostic metadata.
+            // This must never change open success or the capture policy.
+            UINT32 endpointBufferFrames = 0;
+            if (SUCCEEDED(m_audioClient->GetBufferSize(&endpointBufferFrames)))
+            {
+                m_endpointBufferFrames = endpointBufferFrames;
+                m_endpointBufferFramesValid = true;
+            }
+
             m_captureEvent.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
             if (!m_captureEvent)
             {
@@ -268,6 +294,15 @@ namespace {
             CapturePacket& packet,
             CaptureError& error) override
         {
+            const auto readStartedAt = CaptureClock::now();
+            ++m_readCallCount;
+            if (m_haveLastReadStart)
+            {
+                UpdateMaximum(m_maxInterReadGapUs, ElapsedMicroseconds(m_lastReadStartedAt, readStartedAt));
+            }
+            m_lastReadStartedAt = readStartedAt;
+            m_haveLastReadStart = true;
+
             error = {};
             packet = {};
             if (stopRequested.load(std::memory_order_acquire))
@@ -308,7 +343,10 @@ namespace {
                 }
                 const DWORD captureHandleIndex = waitHandleCount;
                 waitHandles[waitHandleCount++] = m_captureEvent.get();
+                const auto waitStartedAt = CaptureClock::now();
+                ++m_waitCallCount;
                 const DWORD waitResult = WaitForMultipleObjects(waitHandleCount, waitHandles, FALSE, waitMilliseconds);
+                UpdateMaximum(m_maxWaitWallUs, ElapsedMicroseconds(waitStartedAt, CaptureClock::now()));
                 if (stopHandleIndex != MAXDWORD && waitResult == WAIT_OBJECT_0 + stopHandleIndex)
                 {
                     return CaptureReadResult::Stopped;
@@ -358,8 +396,13 @@ namespace {
             {
                 return CaptureReadResult::Failed;
             }
+            const auto bufferAcquiredAt = CaptureClock::now();
+            ++m_getBufferCount;
+            if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0)
+            {
+                ++m_timestampErrorCount;
+            }
             packet.m_rawFlags = flags;
-            (void)devicePosition;
             (void)qpcPosition;
 
             bool packetValid = true;
@@ -415,6 +458,7 @@ namespace {
             }
 
             const HRESULT releaseResult = m_captureClient->ReleaseBuffer(frames);
+            UpdateMaximum(m_maxBufferHoldUs, ElapsedMicroseconds(bufferAcquiredAt, CaptureClock::now()));
             if (SetWasapiErrorIfFailed(releaseResult, CaptureErrorCode::ReadFailed, L"IAudioCaptureClient::ReleaseBuffer", error))
             {
                 return CaptureReadResult::Failed;
@@ -436,6 +480,20 @@ namespace {
             {
                 return CaptureReadResult::Timeout;
             }
+
+            const auto packetCompletedAt = CaptureClock::now();
+            if (packet.m_discontinuity)
+            {
+                ++m_discontinuityCount;
+                TraceDiscontinuityDiagnostics(flags, devicePosition, frames, packetCompletedAt);
+            }
+            else
+            {
+                (void)ObserveDevicePosition(flags, devicePosition, frames);
+            }
+            ++m_capturePacketCount;
+            m_lastPacketCompletedAt = packetCompletedAt;
+            m_haveLastPacketCompletion = true;
             return CaptureReadResult::Packet;
         }
 
@@ -484,6 +542,8 @@ namespace {
                 }
             }
 
+            TraceCaptureDiagnostics();
+
             m_captureClient.reset();
             m_audioClient.reset();
             m_endpoint.reset();
@@ -495,6 +555,84 @@ namespace {
         }
 
     private:
+        bool ObserveDevicePosition(DWORD flags, UINT64 devicePosition, UINT32 frames) noexcept
+        {
+            if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0)
+            {
+                m_havePreviousDevicePosition = false;
+                return false;
+            }
+            if (!m_havePreviousDevicePosition)
+            {
+                m_previousDevicePosition = devicePosition;
+                m_previousDeviceFrames = frames;
+                m_havePreviousDevicePosition = true;
+                return false;
+            }
+            if (devicePosition <= m_previousDevicePosition)
+            {
+                m_havePreviousDevicePosition = false;
+                return false;
+            }
+            m_previousDevicePosition = devicePosition;
+            m_previousDeviceFrames = frames;
+            return true;
+        }
+
+        void TraceDiscontinuityDiagnostics(
+            DWORD flags, UINT64 devicePosition, UINT32 frames, CaptureClock::time_point packetCompletedAt) noexcept
+        {
+            const bool packetGapValid = m_haveLastPacketCompletion;
+            const std::uint64_t packetGapUs = packetGapValid ? ElapsedMicroseconds(m_lastPacketCompletedAt, packetCompletedAt) : 0;
+            // Worker-side completion spacing, not a device timestamp or sample gap.
+            detail::TraceAudioWorker(L"CaptureDiscontinuityCompletionGapUs", packetGapValid ? 1U : 0U, packetGapUs);
+
+            if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0)
+            {
+                detail::TraceAudioWorker(L"CaptureDiscontinuityPositionInvalidTimestampError", devicePosition, frames);
+                m_havePreviousDevicePosition = false;
+                return;
+            }
+            if (!m_havePreviousDevicePosition)
+            {
+                detail::TraceAudioWorker(L"CaptureDiscontinuityPositionInvalidNoBaseline", devicePosition, frames);
+                (void)ObserveDevicePosition(flags, devicePosition, frames);
+                return;
+            }
+            if (devicePosition == m_previousDevicePosition)
+            {
+                detail::TraceAudioWorker(L"CaptureDiscontinuityPositionInvalidStale", m_previousDevicePosition, devicePosition);
+                return;
+            }
+            if (devicePosition < m_previousDevicePosition)
+            {
+                detail::TraceAudioWorker(L"CaptureDiscontinuityPositionInvalidReversed", m_previousDevicePosition, devicePosition);
+                return;
+            }
+
+            detail::TraceAudioWorker(L"CaptureDiscontinuityPositionForward", m_previousDevicePosition, devicePosition);
+            detail::TraceAudioWorker(
+                L"CaptureDiscontinuityPositionDeltaExpected", devicePosition - m_previousDevicePosition, m_previousDeviceFrames);
+            (void)ObserveDevicePosition(flags, devicePosition, frames);
+        }
+
+        void TraceCaptureDiagnostics() noexcept
+        {
+            if (!m_openAttempted || m_captureDiagnosticsReported)
+            {
+                return;
+            }
+            m_captureDiagnosticsReported = true;
+            detail::TraceAudioWorker(L"CaptureDiagnosticsPackets", m_capturePacketCount, m_discontinuityCount);
+            detail::TraceAudioWorker(L"CaptureDiagnosticsTimestampErrors", m_timestampErrorCount, m_getBufferCount);
+            detail::TraceAudioWorker(L"CaptureDiagnosticsReadLoopGapUs", m_readCallCount, m_maxInterReadGapUs);
+            detail::TraceAudioWorker(L"CaptureDiagnosticsWaitWallUs", m_waitCallCount, m_maxWaitWallUs);
+            detail::TraceAudioWorker(L"CaptureDiagnosticsBufferHoldUs", m_getBufferCount, m_maxBufferHoldUs);
+            detail::TraceAudioWorker(L"CaptureDiagnosticsEndpointBufferFrames",
+                m_endpointBufferFramesValid ? m_endpointBufferFrames : 0U,
+                m_endpointBufferFramesValid ? 1U : 0U);
+        }
+
         wil::com_ptr<IMMDeviceEnumerator> m_enumerator;
         wil::com_ptr<IMMDevice> m_device;
         wil::com_ptr<IMMEndpoint> m_endpoint;
@@ -507,6 +645,25 @@ namespace {
         DWORD m_mmcssThreadId{};
         bool m_streamStarted{};
         bool m_openAttempted{};
+        bool m_endpointBufferFramesValid{};
+        bool m_captureDiagnosticsReported{};
+        bool m_haveLastReadStart{};
+        bool m_haveLastPacketCompletion{};
+        bool m_havePreviousDevicePosition{};
+        std::uint32_t m_endpointBufferFrames{};
+        std::uint64_t m_readCallCount{};
+        std::uint64_t m_waitCallCount{};
+        std::uint64_t m_getBufferCount{};
+        std::uint64_t m_capturePacketCount{};
+        std::uint64_t m_discontinuityCount{};
+        std::uint64_t m_timestampErrorCount{};
+        std::uint64_t m_maxInterReadGapUs{};
+        std::uint64_t m_maxWaitWallUs{};
+        std::uint64_t m_maxBufferHoldUs{};
+        UINT64 m_previousDevicePosition{};
+        UINT32 m_previousDeviceFrames{};
+        CaptureClock::time_point m_lastReadStartedAt{};
+        CaptureClock::time_point m_lastPacketCompletedAt{};
         WasapiInitialPacketPolicy m_initialPacketPolicy;
     };
 
