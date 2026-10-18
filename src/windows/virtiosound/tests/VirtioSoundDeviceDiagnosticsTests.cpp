@@ -155,7 +155,8 @@ namespace {
         Put(guest, descriptor + 14, next, 2);
     }
 
-    void SubmitControl(FakeGuest& guest, VirtioSoundDevice& device, std::uint16_t availableIndex, const std::uint8_t* request, std::size_t requestBytes)
+    void SubmitControl(FakeGuest& guest, VirtioSoundDevice& device, std::uint16_t availableIndex, const std::uint8_t* request, std::size_t requestBytes,
+        std::uint32_t expectedStatus = 0x8000)
     {
         std::copy_n(request, requestBytes, guest.m_memory.data() + 0x4000);
         PutDescriptor(guest, 0x1000, 0, 0x4000, static_cast<std::uint32_t>(requestBytes), 1, 1);
@@ -164,7 +165,7 @@ namespace {
         Put(guest, 0x2000 + 4ULL + 2ULL * slot, 0, 2);
         Put(guest, 0x2002, availableIndex, 2);
         Require(device.ProcessControlQueue() == 1, "PCM control command completes");
-        Require(Get(guest, 0x5000, 4) == 0x8000, "PCM control command succeeds");
+        Require(Get(guest, 0x5000, 4) == expectedStatus, "PCM control command returns expected status");
     }
 
     void PublishCapture(FakeGuest& guest, std::uint16_t ringSlot, std::uint16_t availableIndex, std::uint16_t head, std::uint64_t request, std::uint64_t payload)
@@ -186,10 +187,8 @@ namespace {
 
         const DiagnosticSnapshot initial = device.GetDiagnosticsSnapshot();
         Require(initial.m_capturePumpCalls == 0 && initial.m_capturePumpCompletedFrames == 0, "Capture counters start at zero");
-        Require(initial.m_captureScratchCapacityGrowths == 1, "Scratch storage is allocated once when the device is created");
-        Require(
-            initial.m_captureScratchCapacityBytes >= VirtioSoundDevice::c_maxTransferBytes - 12,
-            "Scratch storage covers the maximum legal PCM payload");
+        Require(initial.m_captureScratchCapacityGrowths == 0 && initial.m_captureScratchCapacityBytes == 0,
+            "An unconfigured device does not allocate PCM scratch");
 
         Require(device.PumpCaptureElapsed(1234) == 0, "Elapsed time is ignored before stream setup");
         Require(device.PumpCaptureElapsed(2345) == 0, "A second elapsed interval is ignored before stream setup");
@@ -205,13 +204,22 @@ namespace {
         setParams[20] = 2;
         setParams[21] = 5;
         setParams[22] = 7;
-        SubmitControl(guest, device, 1, setParams.data(), setParams.size());
+        auto invalidParams = setParams;
+        invalidParams[12] = 0; // A zero period must not allocate storage.
+        SubmitControl(guest, device, 1, invalidParams.data(), invalidParams.size(), 0x8001);
+        Require(device.GetDiagnosticsSnapshot().m_captureScratchCapacityBytes == 0,
+            "Invalid configuration does not allocate PCM scratch");
+        SubmitControl(guest, device, 2, setParams.data(), setParams.size());
+        const DiagnosticSnapshot configured = device.GetDiagnosticsSnapshot();
+        Require(configured.m_captureScratchCapacityGrowths == 1 &&
+            configured.m_captureScratchCapacityBytes >= VirtioSoundDevice::c_maxTransferBytes - 12,
+            "Valid configuration allocates the full legal PCM bound before START");
         std::array<std::uint8_t, 8> command{};
         command[0] = 2;
         command[1] = 1;
-        SubmitControl(guest, device, 2, command.data(), command.size());
-        command[0] = 4;
         SubmitControl(guest, device, 3, command.data(), command.size());
+        command[0] = 4;
+        SubmitControl(guest, device, 4, command.data(), command.size());
 
         PublishCapture(guest, 0, 1, 0, 0xa000, 0xb000);
         PublishCapture(guest, 1, 2, 2, 0xa100, 0xb100);
@@ -237,7 +245,7 @@ namespace {
         Require(after.m_captureMaximumSourceAvailableFrames == 64, "Source frame backlog high-water is recorded");
         Require(after.m_captureScratchCapacityGrowths == 1, "Repeated periods do not grow the scratch allocation");
         Require(
-            after.m_captureScratchCapacityBytes == initial.m_captureScratchCapacityBytes,
+            after.m_captureScratchCapacityBytes == configured.m_captureScratchCapacityBytes,
             "Scratch capacity stays fixed while periods are copied");
 
         device.Reset();
@@ -245,8 +253,15 @@ namespace {
         Require(afterReset.m_capturePumpCompletedFrames == 32, "Lifetime capture totals survive a device reset");
         Require(afterReset.m_captureScratchCapacityGrowths == 1, "Reset retains the bounded scratch storage");
         Require(
-            afterReset.m_captureScratchCapacityBytes == initial.m_captureScratchCapacityBytes,
+            afterReset.m_captureScratchCapacityBytes == configured.m_captureScratchCapacityBytes,
             "Reset retains the same scratch capacity");
+        Negotiate(device);
+        ConfigureQueue(device, 0, 0x1000, 0x2000, 0x3000);
+        SubmitControl(guest, device, 1, setParams.data(), setParams.size());
+        const DiagnosticSnapshot reconfigured = device.GetDiagnosticsSnapshot();
+        Require(reconfigured.m_captureScratchCapacityGrowths == 1 &&
+            reconfigured.m_captureScratchCapacityBytes == configured.m_captureScratchCapacityBytes,
+            "Reconfiguration reuses scratch without allocating on the capture path");
     }
 } // namespace
 

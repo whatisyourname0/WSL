@@ -11,6 +11,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -133,14 +134,6 @@ public:
         if (!m_pcmSource && (m_format.m_channels != 2 || m_format.m_sampleRate != 48000))
         {
             throw std::invalid_argument("A PCM source is required for non-default formats");
-        }
-
-        // The guest transport bounds each PCM payload to this size. Allocate
-        // the reusable scratch once so steady-state periods do not allocate.
-        m_pcmScratch.resize(c_maxPcmPayloadBytes);
-        if (m_pcmScratch.capacity() != 0)
-        {
-            Increment(m_captureScratchCapacityGrowths);
         }
 
         WriteLe(m_pci.data(), 0, VirtioSoundDevice::c_vendorId, 2);
@@ -768,6 +761,22 @@ public:
             {
                 return StatusResponse(c_statusNotSupported);
             }
+        }
+        // An idle device needs no PCM scratch. Commit its bounded allocation
+        // on the first valid configuration, before capture can start, then
+        // retain it across resets and later configurations. The full transport
+        // bound preserves support for legal RX chains larger than one period.
+        if (m_pcmScratch.empty())
+        {
+            try
+            {
+                m_pcmScratch.resize(c_maxPcmPayloadBytes);
+            }
+            catch (const std::bad_alloc&)
+            {
+                return StatusResponse(c_statusIoError);
+            }
+            Increment(m_captureScratchCapacityGrowths);
         }
         StopSource();
         m_bufferBytes = newBufferBytes;
