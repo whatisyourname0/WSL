@@ -116,8 +116,137 @@ validation of changed source. WSL package version numbers and the WSL1/WSL2
 architecture designation are separate version axes.
 
 Source-clocked capture rejects PCM buffer/period configurations that cannot
-sustain the nominal 10 ms host pump interval. The per-pump budget retains one
+sustain a conservative 10 ms service interval. The per-pump budget retains one
 guest period of headroom and must contain at least 10 ms of frames in complete
 periods. At 48 kHz, a 512-frame buffer with a 128-frame period is unsupported;
 a 1024-frame buffer with a 256-frame period satisfies this capacity check.
 This is a throughput constraint, not a guarantee against host scheduling stalls.
+
+## Capture scheduling and performance diagnostics
+
+The HDV child waits on stop, parent exit, stop preparation, and coalescing capture
+events. Source data has a separate event from readiness/failure and guest RX/state
+changes so that only data arrivals can be deferred. RX queue
+notifications remain enabled; HDV callbacks signal the owner and never transfer
+PCM themselves. A shared event owner remains alive with pinned callback state.
+The core services pending START and failure transitions even when PCM transfer
+is deferred. Source-clocked capture waits indefinitely when idle, waiting for
+readiness, missing a source period, or missing a guest RX buffer.
+
+Each service transfers at most one negotiated period. An explicit completion
+deadline prevents repeated events from granting extra sample credit. Sub-period
+lateness advances the previous absolute deadline to avoid cumulative scheduling
+drift; a delay of a full period rebases the phase rather than replaying all missed
+slots. A completed period arms one deadline to coalesce incoming partial packets;
+an empty rescan disarms it. Runnable backlog also arms a deadline; synthetic input uses
+deadlines to advance its sample clock. This is a bounded completion-rate policy,
+not proof that an ALSA application consumed the previous period. The conservative
+10 ms configuration capacity check remains unchanged. Scheduling stalls can
+still overflow bounded queues and must surface as errors, not dropped audio.
+
+The worker session and source controller each own one overlapped reader and
+writer, and wait on their completion events alongside state/process events.
+Readers have no idle timeout. The partial-frame deadline starts when `Advance`
+observes completion of the first header read and covers the rest of that frame. Writes have a bounded deadline, and pending IO is canceled and
+drained before closing a pipe or releasing its buffers. Control transitions get
+an opportunity between received frames, including under continuous PCM input.
+The worker preserves response order in a bounded queue and drains Closed/Fault
+before normal exit. Authentication, restricted tokens, jobs, and frame limits
+remain in place. Bootstrap connection/handshake waits are separate from this
+steady-state loop.
+
+WASAPI waits on capture and stop events. A 1-second endpoint-health deadline
+rechecks device state if capture callbacks stop; it is not a transfer cadence.
+The controller retains its 1-second session-health check and lifecycle deadlines.
+No shared memory, zero-copy, IOCP, or interrupt coalescing is introduced here.
+
+`DiagnosticSnapshot` exposes device-lifetime saturating totals for pump calls,
+requested/completed frames, calls without a successful completion, elapsed call
+count and nanoseconds, maximum interval, and observed source/RX backlog. Scratch
+capacity and growth count show the retained allocation cost. These counters
+survive guest device reset and contain no PCM, endpoint identifiers, or per-period
+records. Backlog values are maxima observed at existing queue reads, not a full
+history of all arrivals. Averages must use matching counters: elapsed totals
+count all elapsed-pump calls, while frame totals count calls reaching the core
+pump, including direct test calls.
+
+After callbacks and pumps drain, guest retirement emits aggregate `CapturePump*`,
+`CaptureInterval*`, `CaptureBacklogMax`, and `CaptureScratch` events through the
+existing AudioSource ETW provider. Normal child shutdown additionally emits
+`CaptureWakeTotals` (event/deadline wakes), `CaptureWakeReasons` (source/guest),
+`CaptureServiceEmpty` (empty/deferred services), `CaptureServiceTime` (total/peak
+nanoseconds), and `CaptureServiceFrames`. Controller cleanup emits
+`CaptureController*` aggregates for state/IO wakes, worker exits, message/byte
+counts, busy writes, write timeouts, and peak write duration. The worker snapshot
+counts queue activity signals; these can coalesce and are not wake counts.
+Forced process exit does not guarantee a summary. No per-period ETW event is
+added by this instrumentation.
+
+The core allocates its bounded PCM scratch vector (1 MiB minus 12 bytes of
+transport overhead) on the first valid PCM configuration, before capture can
+start, and retains it across resets and later configurations. The worker retains its validated IPC wire buffer
+and one overlapped event per writer. Both buffers can retain previous PCM in
+private process memory until overwritten or destroyed; diagnostics never export
+them. Pipe cancellation drains outstanding I/O before reuse. A failed write can
+leave a partial wire frame, so the pipe session must be discarded even though
+the writer's buffer and event can be reused with a fresh pipe.
+
+The [comparison benchmark](../../../src/windows/virtiosound/benchmarks/README.md)
+builds one harness against baseline and candidate core sources. Its allocation
+counts and the deterministic scheduler simulation do not measure microphone
+latency, host CPU consumption, or timer behavior under VM load. The event
+scheduler tests also cover repeated late wakes, long stalls, duplicate events,
+idle waits, and synthetic deadlines. Local byte-pipe tests cover partial frames,
+duplex progress, timeout, cancellation, and reuse. These checks do not exercise
+the complete authenticated process graph or physical endpoint loss. Validate
+those separately before claiming end-to-end performance gains.
+
+## Capture queue observability and source wake deferral
+
+Source-data notifications use a separate auto-reset event from source state and
+guest notifications. The pump excludes only the data event while a completion
+deadline is pending or a clocked source is waiting for RX buffers. State changes,
+failure, guest queue updates, shutdown, and stop preparation remain waitable.
+Deferred data stays signaled across early urgent rescans. The first successful
+transfer anchors the pacing phase; a partial startup packet does not. A completion
+arms one deadline even if the source tail is partial; an empty rescan disarms it.
+This is a completion guard, not recurring idle polling.
+
+The core emits six event-weighted backlog buckets in negotiated-period units:
+zero, less than one, one to less than two, two to less than four, four to less than
+eight, and eight or more. Samples occur once per ready, running service before
+transfer. They are not time-weighted percentiles or end-to-end latency. Normal
+PCM_RELEASE status-only returns use `CaptureReleaseBuffer`; actual capture errors
+retain `CaptureStatusError`. Wire status and descriptor handling are unchanged.
+
+The independent Python probe's optional `--telemetry` output adds negotiated ALSA
+parameters and bounded per-channel signal summaries. It retains no audio file,
+and its extra observer work must be included in performance comparisons.
+
+Completion rate, per-service frame bounds, and ring limits are unchanged. In
+particular, this change does not accelerate delivery to repay long scheduling
+stalls: source occupancy alone cannot establish safe space in the guest ALSA
+ring. A retained backlog remains a latency limitation requiring separate guest
+consumption and physical endpoint validation.
+
+## RX doorbell shutdown ordering
+
+Normal VM shutdown requests RX doorbell preparation before closing the mini_init
+channel. The private HDV child unregisters the optional doorbell from its pump
+thread, outside callbacks, and acknowledges the result. Stop preparation drains
+in-flight registration and prevents new registration; MMIO notification fallback
+remains available during guest shutdown. Post-exit retirement does not retry
+unregister against a stopped device.
+
+If preparation times out or its wait fails, the parent clears the pending request
+and closes only its owned kill-on-close child job. The request wait and emergency
+exit wait are each bounded to two seconds, though OS scheduling can extend elapsed
+time. Emergency exit is not reported as successful unregister. Uncertain event
+ownership remains pinned until the private process exits, and shared or unknown
+HDV host ownership never permits whole-host teardown.
+
+The ordering guarantee applies to orderly stop. An independent guest exit can
+race a preparation already in flight; unregister may then return an invalid-state
+error. Failure retains the event/callback root and is negatively acknowledged,
+rather than being treated as successful unregister. No cross-process state check
+can make that independent exit atomic with an HDV API call.

@@ -23,6 +23,7 @@ DEADLINE_PADDING_SECONDS = 10
 MAX_DEADLINE_SECONDS = 610
 WAIT_SLICE_MS = 250
 READ_CHUNK_FRAMES = 1_024
+TELEMETRY_WINDOW_FRAMES = RATE_HZ
 ALSA_PCM_STREAM_CAPTURE = 1
 ALSA_PCM_NONBLOCK = 1
 ALSA_PCM_FORMAT_S16_LE = 2
@@ -67,6 +68,52 @@ class CaptureStats:
     rms: float
     peak: int
     nonzero_samples: int
+
+
+@dataclass
+class ChannelSignalStats:
+    """Fixed-size signal aggregates for one channel."""
+
+    samples: int = 0
+    sum_squares: int = 0
+    sum_samples: int = 0
+    peak: int = 0
+    negative_full_scale_samples: int = 0
+    positive_full_scale_samples: int = 0
+    longest_zero_run: int = 0
+    current_zero_run: int = 0
+
+    def add(self, sample: int) -> None:
+        self.samples += 1
+        self.sum_squares += sample * sample
+        self.sum_samples += sample
+        magnitude = -sample if sample < 0 else sample
+        if magnitude > self.peak:
+            self.peak = magnitude
+        if sample == -32_768:
+            self.negative_full_scale_samples += 1
+        elif sample == 32_767:
+            self.positive_full_scale_samples += 1
+        if sample == 0:
+            self.current_zero_run += 1
+            if self.current_zero_run > self.longest_zero_run:
+                self.longest_zero_run = self.current_zero_run
+        else:
+            self.current_zero_run = 0
+
+    def payload(self, channel: int) -> dict[str, int | float]:
+        rms = math.sqrt(self.sum_squares / self.samples) if self.samples else 0.0
+        dc_offset = self.sum_samples / self.samples if self.samples else 0.0
+        return {
+            "channel": channel,
+            "samples": self.samples,
+            "rms": round(rms, 6),
+            "peak": self.peak,
+            "negative_full_scale_samples": self.negative_full_scale_samples,
+            "positive_full_scale_samples": self.positive_full_scale_samples,
+            "longest_zero_run_samples": self.longest_zero_run,
+            "dc_offset": round(dc_offset, 6),
+        }
 
 
 @dataclass
@@ -210,6 +257,7 @@ def capture(
     monotonic: Callable[[], float] = time.monotonic,
     chunk_frames: int = READ_CHUNK_FRAMES,
     diagnostics: CaptureDiagnostics | None = None,
+    telemetry: Callable[[dict[str, object]], None] | None = None,
 ) -> CaptureStats:
     """Capture exact-duration S16_LE stereo frames and retain aggregates only."""
     if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int):
@@ -247,6 +295,17 @@ def capture(
             negotiated_params = None
         if negotiated_params is not None:
             diagnostic_state.buffer_frames, diagnostic_state.period_frames = negotiated_params
+        if telemetry is not None:
+            telemetry(
+                {
+                    "type": "stream_setup",
+                    "rate_hz": RATE_HZ,
+                    "channels": CHANNELS,
+                    "format": "S16_LE",
+                    "buffer_frames": diagnostic_state.buffer_frames,
+                    "period_frames": diagnostic_state.period_frames,
+                }
+            )
 
         _check_deadline(monotonic, deadline)
         result = backend.start(handle)
@@ -260,6 +319,9 @@ def capture(
         sum_squares = 0
         peak = 0
         nonzero_samples = 0
+        aggregate_channels = [ChannelSignalStats() for _ in range(CHANNELS)] if telemetry else None
+        window_channels = [ChannelSignalStats() for _ in range(CHANNELS)] if telemetry else None
+        window_frames = 0
 
         while frames_read < target_frames:
             loop_started = monotonic()
@@ -295,16 +357,61 @@ def capture(
 
             frames_read += count
             diagnostic_state.frames_read = frames_read
-            for sample in buffer[: count * CHANNELS]:
-                magnitude = abs(int(sample))
-                peak = max(peak, magnitude)
-                sum_squares += int(sample) * int(sample)
-                nonzero_samples += int(sample != 0)
-                sample_count += 1
+            if telemetry is None:
+                for sample in buffer[: count * CHANNELS]:
+                    value = int(sample)
+                    magnitude = -value if value < 0 else value
+                    peak = max(peak, magnitude)
+                    sum_squares += value * value
+                    nonzero_samples += int(value != 0)
+                    sample_count += 1
+            else:
+                # Keep the opt-in observer streaming: only one fixed window and
+                # one lifetime aggregate per channel are retained.
+                assert aggregate_channels is not None and window_channels is not None
+                for frame in range(count):
+                    sample_index = frame * CHANNELS
+                    for channel in range(CHANNELS):
+                        value = int(buffer[sample_index + channel])
+                        aggregate_channels[channel].add(value)
+                        window_channels[channel].add(value)
+                        magnitude = -value if value < 0 else value
+                        peak = max(peak, magnitude)
+                        sum_squares += value * value
+                        nonzero_samples += int(value != 0)
+                        sample_count += 1
+                    window_frames += 1
+                    if window_frames == TELEMETRY_WINDOW_FRAMES:
+                        telemetry(
+                            {
+                                "type": "window",
+                                "frames": window_frames,
+                                "start_frame": sample_count // CHANNELS - window_frames,
+                                "end_frame": sample_count // CHANNELS,
+                                "channels": [
+                                    stats.payload(channel)
+                                    for channel, stats in enumerate(window_channels)
+                                ],
+                            }
+                        )
+                        window_channels = [ChannelSignalStats() for _ in range(CHANNELS)]
+                        window_frames = 0
 
         _check_deadline(monotonic, deadline)
         diagnostic_state.frames_read = frames_read
         diagnostic_state.elapsed_seconds = max(0.0, monotonic() - capture_started)
+        if telemetry is not None:
+            assert aggregate_channels is not None
+            telemetry(
+                {
+                    "type": "aggregate",
+                    "frames": frames_read,
+                    "channels": [
+                        stats.payload(channel)
+                        for channel, stats in enumerate(aggregate_channels)
+                    ],
+                }
+            )
         rms = math.sqrt(sum_squares / sample_count) if sample_count else 0.0
         return CaptureStats(
             frames=frames_read,
@@ -357,6 +464,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="confirm that capture of the selected input is authorized",
     )
+    parser.add_argument(
+        "--telemetry",
+        action="store_true",
+        help="stream bounded per-channel signal summaries to stderr once per second",
+    )
     return parser
 
 
@@ -365,7 +477,21 @@ def main(argv: list[str] | None = None) -> int:
     diagnostics = CaptureDiagnostics()
     try:
         backend = NativeAlsaBackend()
-        stats = capture(backend, args.device, args.duration, diagnostics=diagnostics)
+        telemetry = None
+        if args.telemetry:
+            telemetry = lambda payload: print(
+                "alsa_capture_probe_telemetry: "
+                + json.dumps(payload, separators=(",", ":"), allow_nan=False),
+                file=sys.stderr,
+                flush=True,
+            )
+        stats = capture(
+            backend,
+            args.device,
+            args.duration,
+            diagnostics=diagnostics,
+            telemetry=telemetry,
+        )
     except (CaptureError, ValueError) as exc:
         print(f"alsa_capture_probe: {exc}", file=sys.stderr)
         if diagnostics.stream_started:

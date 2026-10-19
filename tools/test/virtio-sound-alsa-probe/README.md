@@ -2,6 +2,8 @@
 
 This standalone Python probe captures an explicitly selected ALSA input as 48 kHz, stereo, interleaved `S16_LE`. It prints one JSON object containing aggregate frame and sample counts, RMS, peak, and nonzero-sample count. It does not save, log, or transmit PCM data and has no playback path.
 
+Pass `--telemetry` to stream one JSON line per second to stderr, plus a stream-setup line and a final aggregate line. These bounded summaries report negotiated ALSA buffer and period sizes and per-channel RMS, peak, signed full-scale counts (`-32768` and `+32767`), longest zero run, and mean signed sample value (`dc_offset`). The successful stdout JSON keeps the same fields with or without telemetry. The probe retains only the current one-second window and fixed-size aggregate counters; it never retains PCM samples.
+
 Capture requires both `--device` and `--acknowledge-microphone-access`. Duration is an integer from 1 to 600 seconds. Reads use nonblocking ALSA mode, bounded waits, and a monotonic deadline of duration plus 10 seconds (capped at 610 seconds). `-EAGAIN` retries after another wait. `-EPIPE` is reported as an XRUN and capture stops without recovery.
 
 Run the mock-only checks from this directory with:
@@ -14,6 +16,12 @@ An authorized local capture has this form:
 
 ```sh
 python3 alsa_capture_probe.py --device hw:0,0 --duration 1 --acknowledge-microphone-access
+```
+
+For live diagnostic summaries, add `--telemetry`:
+
+```sh
+python3 alsa_capture_probe.py --device hw:0,0 --duration 1 --acknowledge-microphone-access --telemetry
 ```
 
 The Compose recipe maps `/dev/snd` without renumbering cards, mounts the probe script read-only, uses a configurable unprivileged UID/GID, drops all Linux capabilities, disables networking, and makes the container root filesystem read-only. Set `ALSA_DEVICE` explicitly to the selected capture device (for example, `hw:0,0`) and set `AUDIO_GID` to its group ID; `PROBE_UID`, `PROBE_GID`, and `DURATION_SECONDS` can also be set. Then run `docker compose -f compose.yaml run --rm capture-probe`.

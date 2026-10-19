@@ -809,6 +809,25 @@ WslCoreVm::~WslCoreVm() noexcept
         bool unexpectedTerminate = m_vmExitEvent.is_signaled();
         bool forcedTerminate = false;
 
+#if defined(WSL_ENABLE_EXPERIMENTAL_VIRTIO_SOUND)
+        if (!unexpectedTerminate && m_hdvHostProcess)
+        {
+            // The guest still owns its BAR until shutdown completes. Ask the
+            // child to unregister only the optional doorbell before closing
+            // mini_init; failure is bounded and leaves the normal VM shutdown
+            // policy and callback fallback intact.
+            const HRESULT prepareResult = m_hdvHostProcess->PrepareForGuestStop();
+            TraceLoggingWriteTagged(
+                activity,
+                "VirtioSoundDoorbellPrepareStop",
+                TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES),
+                TelemetryPrivacyDataTag(PDT_ProductAndServicePerformance),
+                TraceLoggingValue(m_runtimeId, "vmId"),
+                TraceLoggingValue(static_cast<std::uint32_t>(prepareResult), "result"),
+                TraceLoggingValue(SUCCEEDED(prepareResult), "prepared"));
+        }
+#endif
+
         // Close the socket to mini_init. This will cause mini_init to break out
         // of its message processing loop and perform a clean shutdown.
         m_miniInitChannel.Close();

@@ -76,3 +76,14 @@ endif()
 if(WSL_VIRTIO_SOUND_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
+
+# The full WSL build registers the same suites with wsltests.dll below
+# test/windows. Standalone developers/CI can opt into a separate TAEF DLL
+# without the machine setup performed by the full WSL test module.
+option(WSL_VIRTIO_SOUND_BUILD_TAEF_TESTS "Build the standalone TAEF adapter" OFF)
+if(WSL_VIRTIO_SOUND_BUILD_TAEF_TESTS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    if(NOT WIN32 OR NOT WSL_VIRTIO_SOUND_BUILD_TESTS)
+        message(FATAL_ERROR "The TAEF adapter requires Windows and WSL_VIRTIO_SOUND_BUILD_TESTS=ON")
+    endif()
+    add_subdirectory(../../../test/windows/virtiosound taef-tests)
+endif()
