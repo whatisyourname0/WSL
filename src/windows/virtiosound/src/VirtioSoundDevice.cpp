@@ -249,6 +249,9 @@ public:
     std::uint16_t m_captureMaximumRxOutstandingAvailable{};
     std::uint32_t m_captureMaximumSourceAvailableFrames{};
     std::uint64_t m_captureScratchCapacityGrowths{};
+    std::array<std::uint64_t, 6> m_captureBacklogSamples{};
+    std::uint64_t m_captureReleaseCompletions{};
+    std::uint64_t m_captureErrorCompletions{};
     std::uint16_t m_queueSelect{};
     std::uint16_t m_configVector{0xffff};
     std::uint8_t m_status{};
@@ -1153,7 +1156,18 @@ public:
 
     void CaptureError(const Chain& chain, std::uint32_t statusCode, std::uint32_t origin)
     {
-        TraceCapture(L"CaptureStatusError", statusCode, origin);
+        // RELEASE returns unused RX descriptors with IO_ERR by protocol; it
+        // is not evidence of a capture failure. Keep the wire status unchanged.
+        if (origin == 5)
+        {
+            Increment(m_captureReleaseCompletions);
+            TraceCapture(L"CaptureReleaseBuffer", statusCode, origin);
+        }
+        else
+        {
+            Increment(m_captureErrorCompletions);
+            TraceCapture(L"CaptureStatusError", statusCode, origin);
+        }
         std::array<std::uint8_t, 8> tail{};
         WriteLe(tail.data(), 0, statusCode, 4);
         Scatter(chain, chain.m_capacity - 8, tail.data(), tail.size());
@@ -1453,12 +1467,26 @@ public:
     {
         std::lock_guard<std::recursive_mutex> lock(m_gate);
         CaptureServiceResult result;
+        const auto before = m_pcmSource ? m_pcmSource->AvailableFrames() : std::nullopt;
+        if (Ready() && IsRunning() && CurrentSourceReadiness() == SourceReadiness::Ready && before.has_value() && m_periodBytes != 0)
+        {
+            const std::uint64_t period = m_periodBytes / m_frameBytes;
+            const std::uint64_t frames = *before;
+            const std::size_t bucket = frames == 0           ? 0
+                                       : frames < period     ? 1
+                                       : frames < 2 * period ? 2
+                                       : frames < 4 * period ? 3
+                                       : frames < 8 * period ? 4
+                                                             : 5;
+            Increment(m_captureBacklogSamples[bucket]);
+        }
         result.m_frames = PumpCaptureElapsed(elapsedNanoseconds, allowTransfer, m_periodBytes / m_frameBytes);
         result.m_generation = m_pacingGeneration;
         result.m_periodFrames = m_periodBytes / m_frameBytes;
         result.m_sampleRate = m_format.m_sampleRate;
         const auto available = m_pcmSource ? m_pcmSource->AvailableFrames() : std::nullopt;
         result.m_sourceClocked = available.has_value();
+        result.m_sourceAvailableFrames = available.value_or(0);
         result.m_moreSourceFrames = available.has_value() && result.m_periodFrames != 0 && *available >= result.m_periodFrames;
         if (!Ready() || !IsRunning())
         {
@@ -1683,6 +1711,9 @@ public:
         snapshot.m_captureMaximumSourceAvailableFrames = m_captureMaximumSourceAvailableFrames;
         snapshot.m_captureScratchCapacityGrowths = m_captureScratchCapacityGrowths;
         snapshot.m_captureScratchCapacityBytes = m_pcmScratch.capacity();
+        snapshot.m_captureBacklogSamples = m_captureBacklogSamples;
+        snapshot.m_captureReleaseCompletions = m_captureReleaseCompletions;
+        snapshot.m_captureErrorCompletions = m_captureErrorCompletions;
         return snapshot;
     }
 };

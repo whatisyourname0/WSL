@@ -1404,6 +1404,10 @@ RetireOutcome HdvPciDeviceHost::GuestStoppedAndRetire() noexcept
         detail::TraceAudioSource(L"CaptureIntervalMax", capture.m_captureMaximumElapsedNanoseconds);
         detail::TraceAudioSource(L"CaptureBacklogMax", capture.m_captureMaximumSourceAvailableFrames, capture.m_captureMaximumRxOutstandingAvailable);
         detail::TraceAudioSource(L"CaptureScratch", capture.m_captureScratchCapacityGrowths, capture.m_captureScratchCapacityBytes);
+        detail::TraceAudioSource(L"CaptureBacklogZeroSubPeriod", capture.m_captureBacklogSamples[0], capture.m_captureBacklogSamples[1]);
+        detail::TraceAudioSource(L"CaptureBacklogOneTwoPeriods", capture.m_captureBacklogSamples[2], capture.m_captureBacklogSamples[3]);
+        detail::TraceAudioSource(L"CaptureBacklogFourEightPeriods", capture.m_captureBacklogSamples[4], capture.m_captureBacklogSamples[5]);
+        detail::TraceAudioSource(L"CaptureReleaseAndErrors", capture.m_captureReleaseCompletions, capture.m_captureErrorCompletions);
         detail::TraceAudioSource(L"CaptureRxKickFastPathRequests", state.m_rxCallbackFastPathRequests.load(std::memory_order_relaxed));
     }
     catch (...)

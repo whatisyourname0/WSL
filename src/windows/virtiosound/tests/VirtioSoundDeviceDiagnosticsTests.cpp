@@ -248,6 +248,37 @@ namespace {
             after.m_captureScratchCapacityBytes == configured.m_captureScratchCapacityBytes,
             "Scratch capacity stays fixed while periods are copied");
 
+        // Only active ServiceCapture calls sample the queue. Direct pumps and
+        // idle time must not inflate this event-weighted distribution.
+        for (const auto frames : {0U, 1U, 16U, 32U, 64U, 128U})
+        {
+            source->m_availableFrames = frames;
+            const auto service = device.ServiceCapture(0, false);
+            Require(service.m_sourceAvailableFrames == frames, "Service exposes post-service queue occupancy");
+        }
+        const auto sampled = device.GetDiagnosticsSnapshot();
+        for (const auto count : sampled.m_captureBacklogSamples)
+        {
+            Require(count == 1, "Each backlog bucket has exactly one active service sample");
+        }
+        PublishCapture(guest, 2, 3, 4, 0xa200, 0xb200);
+        PublishCapture(guest, 3, 4, 6, 0xa300, 0xb300);
+        command[0] = 5; // STOP
+        SubmitControl(guest, device, 5, command.data(), command.size());
+        (void)device.ServiceCapture(1'000'000'000, false);
+        command[0] = 3; // RELEASE returns unused buffers, without a capture fault.
+        SubmitControl(guest, device, 6, command.data(), command.size());
+        const auto released = device.GetDiagnosticsSnapshot();
+        Require(
+            released.m_captureBacklogSamples == sampled.m_captureBacklogSamples,
+            "Idle service does not sample stale source frames");
+        Require(
+            released.m_captureReleaseCompletions == 2 && released.m_captureErrorCompletions == 0,
+            "Expected release completions are separate from capture errors");
+        Require(
+            Get(guest, 0xb240, 4) == 0x8003 && Get(guest, 0xb340, 4) == 0x8003,
+            "Diagnostic classification does not change RELEASE wire status");
+
         device.Reset();
         const DiagnosticSnapshot afterReset = device.GetDiagnosticsSnapshot();
         Require(afterReset.m_capturePumpCompletedFrames == 32, "Lifetime capture totals survive a device reset");

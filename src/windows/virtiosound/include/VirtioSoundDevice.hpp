@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -105,6 +106,8 @@ struct CaptureServiceResult
     std::uint32_t m_sampleRate{};
     bool m_sourceClocked{};
     bool m_moreSourceFrames{};
+    // Queued source frames after this service, not an end-to-end latency.
+    std::uint32_t m_sourceAvailableFrames{};
 };
 
 struct DiagnosticSnapshot
@@ -138,6 +141,12 @@ struct DiagnosticSnapshot
     std::uint32_t m_captureMaximumSourceAvailableFrames{};
     std::uint64_t m_captureScratchCapacityGrowths{};
     std::size_t m_captureScratchCapacityBytes{};
+    // One pre-transfer sample per running, ready ServiceCapture call. Buckets
+    // are 0, (0,1), [1,2), [2,4), [4,8), [8,infinity) negotiated periods.
+    // Event-weighted counts, not time-weighted latency percentiles.
+    std::array<std::uint64_t, 6> m_captureBacklogSamples{};
+    std::uint64_t m_captureReleaseCompletions{};
+    std::uint64_t m_captureErrorCompletions{};
 };
 
 class VirtioSoundDevice final
