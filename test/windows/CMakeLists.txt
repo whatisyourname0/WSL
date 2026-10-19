@@ -43,5 +43,9 @@ add_subdirectory(testplugin)
 add_subdirectory(wsl)
 add_subdirectory(wslc)
 
+if(WSL_ENABLE_EXPERIMENTAL_VIRTIO_SOUND AND WSL_VIRTIO_SOUND_BUILD_TESTS)
+    add_subdirectory(virtiosound)
+endif()
+
 # For prettier source tree browsing
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SOURCES} ${HEADERS})

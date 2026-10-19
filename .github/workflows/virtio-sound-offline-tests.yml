@@ -6,6 +6,11 @@ on:
     paths:
       - 'src/windows/virtiosound/**'
       - 'src/windows/service/exe/**'
+      - 'test/windows/virtiosound/**'
+      - 'test/windows/common/TestClass.h'
+      - 'test/windows/CMakeLists.txt'
+      - 'packages.config'
+      - '.pipelines/build-job.yml'
       - 'tools/test/virtio-sound-alsa-probe/**'
       - '.github/workflows/virtio-sound-offline-tests.yml'
 
@@ -43,10 +48,20 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure standalone test build
-        run: cmake -S src/windows/virtiosound -B "${env:RUNNER_TEMP}\wsl-virtio-sound" -A x64 -DWSL_VIRTIO_SOUND_BUILD_TESTS=ON
+        run: |
+          $version = (Select-Xml -Path packages.config -XPath '/packages/package[@id="Microsoft.Taef"]/@version').Node.Value
+          $package = "${env:RUNNER_TEMP}\taef.zip"
+          Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.taef/$version/microsoft.taef.$version.nupkg" -OutFile $package
+          Expand-Archive $package -DestinationPath "${env:RUNNER_TEMP}\taef"
+          cmake -S src/windows/virtiosound -B "${env:RUNNER_TEMP}\wsl-virtio-sound" -A x64 -DWSL_VIRTIO_SOUND_BUILD_TESTS=ON -DWSL_VIRTIO_SOUND_BUILD_TAEF_TESTS=ON "-DWSL_VIRTIO_SOUND_TAEF_ROOT=${env:RUNNER_TEMP}\taef"
 
       - name: Build standalone tests
         run: cmake --build "${env:RUNNER_TEMP}\wsl-virtio-sound" --config Release --parallel 2
 
       - name: Run hardware-independent CTest suites
         run: ctest --test-dir "${env:RUNNER_TEMP}\wsl-virtio-sound" --build-config Release --output-on-failure
+
+      - name: Run the repository TAEF test adapter without WSL setup
+        run: |
+          & "${env:RUNNER_TEMP}\taef\build\Binaries\x64\TE.exe" "${env:RUNNER_TEMP}\wsl-virtio-sound\taef-tests\Release\wsl_virtio_sound_taef_tests.dll" /name:*VirtioSoundUnitTests* /sessionTimeout:0:05:00
+          exit $LASTEXITCODE
