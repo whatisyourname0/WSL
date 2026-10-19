@@ -181,13 +181,17 @@ inline int Run(int argc, wchar_t** argv) noexcept
         native::windows::detail::TraceAudioSource(L"HostPumpClockOrigin", toNanoseconds(clock::now()));
         // A startup rescan covers state published before this loop began.
         captureWake->Notify(native::windows::CaptureWakeReason::GuestState);
-        const HANDLE waits[]{stop, parent, prepareRequest, captureWake->Event()};
+        const HANDLE waits[]{stop, parent, prepareRequest, captureWake->Event(), captureWake->DataEvent()};
         for (;;)
         {
             const auto beforeWait = clock::now();
             const auto beforeWaitNanoseconds = toNanoseconds(beforeWait);
             const auto requestedWaitMilliseconds = scheduler.WaitTimeoutMilliseconds(beforeWaitNanoseconds);
-            const DWORD wait = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, requestedWaitMilliseconds);
+            const bool deferSourceData = scheduler.DeferSourceData(beforeWaitNanoseconds);
+            // Keep stop, parent lifetime, prepare, and source/guest state in
+            // every wait. Only a data-only wake is held until the next rescan.
+            const DWORD waitHandleCount = deferSourceData ? 4U : 5U;
+            const DWORD wait = WaitForMultipleObjects(waitHandleCount, waits, FALSE, requestedWaitMilliseconds);
             const DWORD waitError = wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
             const auto waitReturned = clock::now();
             const auto waitReturnedNanoseconds = toNanoseconds(waitReturned);
@@ -243,7 +247,7 @@ inline int Run(int argc, wchar_t** argv) noexcept
                 recordWaitOnlyIfSlow();
                 THROW_WIN32(waitError);
             }
-            if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0 + 3)
+            if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0 + 3 && (deferSourceData || wait != WAIT_OBJECT_0 + 4))
             {
                 recordWaitOnlyIfSlow();
                 THROW_HR(E_UNEXPECTED);
@@ -254,6 +258,18 @@ inline int Run(int argc, wchar_t** argv) noexcept
             // State events never grant sample credit. Always service readiness
             // and failures, even when the completion-rate deadline is not due.
             lastPump = pumpStarted;
+            // While source data is deferred, an early state/guest wake may
+            // service state without being allowed to discard the pending data
+            // wake. Drain it only once data is eligible again or the scheduled
+            // deadline itself caused this rescan; otherwise its signal must
+            // survive reason consumption in case service leaves the scheduler
+            // unarmed.
+            if (!deferSourceData || wait == WAIT_TIMEOUT)
+            {
+                // A producer racing this drain either contributes to this
+                // rescan or leaves its event signaled for the following one.
+                (void)WaitForSingleObject(captureWake->DataEvent(), 0);
+            }
             const auto reasons = captureWake->Consume();
             if (wait == WAIT_TIMEOUT)
             {

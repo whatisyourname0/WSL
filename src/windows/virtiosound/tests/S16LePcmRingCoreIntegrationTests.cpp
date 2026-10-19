@@ -2,6 +2,7 @@
 
 #include "S16LePcmRing.hpp"
 #include "VirtioSoundDevice.hpp"
+#include "../../service/exe/CaptureEventScheduler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -190,6 +191,16 @@ void FillStereoFrames(std::uint32_t first, std::uint32_t count, std::uint8_t* de
     }
 }
 
+void EncodeSequenceFrame(std::uint32_t sequence, std::uint8_t* destination)
+{
+    const std::uint16_t left = static_cast<std::uint16_t>(sequence);
+    const std::uint16_t right = static_cast<std::uint16_t>(sequence >> 16);
+    destination[0] = static_cast<std::uint8_t>(left);
+    destination[1] = static_cast<std::uint8_t>(left >> 8);
+    destination[2] = static_cast<std::uint8_t>(right);
+    destination[3] = static_cast<std::uint8_t>(right >> 8);
+}
+
 void QueueCaptureDescriptors(FakeGuest& guest, std::uint16_t count, std::uint32_t payloadBytes)
 {
     const std::uint32_t stride = payloadBytes + 8;
@@ -203,6 +214,21 @@ void QueueCaptureDescriptors(FakeGuest& guest, std::uint16_t count, std::uint32_
         PutDescriptor(guest, 0x10000, static_cast<std::uint16_t>(requestIndex + 1), payloadAddress, stride, 2, 0);
         PublishHead(guest, 0x12000, i, static_cast<std::uint16_t>(i + 1), requestIndex);
     }
+}
+
+void RepostCaptureDescriptor(FakeGuest& guest, std::uint16_t bufferSlot, std::uint16_t& availableIndex, std::uint32_t payloadBytes)
+{
+    constexpr std::uint16_t c_queueEntries = VirtioSoundDevice::c_maxQueueSize;
+    const std::uint16_t requestIndex = static_cast<std::uint16_t>(bufferSlot * 2);
+    const std::uint32_t stride = payloadBytes + 8;
+    const std::uint64_t requestAddress = 0x20000 + static_cast<std::uint64_t>(bufferSlot) * 4;
+    const std::uint64_t payloadAddress = 0x30000 + static_cast<std::uint64_t>(bufferSlot) * stride;
+    Put(guest, requestAddress, 0, 4);
+    PutDescriptor(guest, 0x10000, requestIndex, requestAddress, 4, 1, static_cast<std::uint16_t>(requestIndex + 1));
+    PutDescriptor(guest, 0x10000, static_cast<std::uint16_t>(requestIndex + 1), payloadAddress, stride, 2, 0);
+    const std::uint16_t ringSlot = static_cast<std::uint16_t>(availableIndex % c_queueEntries);
+    ++availableIndex;
+    PublishHead(guest, 0x12000, ringSlot, availableIndex, requestIndex);
 }
 
 std::unique_ptr<VirtioSoundDevice> CreateDevice(FakeGuest& guest, const std::shared_ptr<S16LePcmRingSource>& ring)
@@ -323,6 +349,222 @@ void TestCoreUnderflowRemainsAnError(int& assertions)
         assertions);
 }
 
+void TestVirtualClockedRingAndSchedulerWithRxCredits(int& assertions)
+{
+    using wsl::virtio_sound::process_host::detail::CaptureEventScheduler;
+
+    constexpr std::uint32_t c_sampleRate = 48000;
+    constexpr std::uint32_t c_framesPerPacket = 480;
+    constexpr std::uint32_t c_periodFrames = 2048;
+    constexpr std::uint32_t c_periodBytes = c_periodFrames * 4;
+    constexpr std::uint32_t c_bufferFrames = c_periodFrames * 4;
+    constexpr std::uint32_t c_queueEntries = VirtioSoundDevice::c_maxQueueSize;
+    constexpr std::uint32_t c_rxBuffers = 4;
+    constexpr std::uint32_t c_packetCount = 6016; // 60.16 seconds, an exact multiple of the guest period.
+    constexpr std::uint32_t c_totalFrames = c_packetCount * c_framesPerPacket;
+    constexpr std::uint64_t c_hostStallStartMs = 5000;
+    constexpr std::uint64_t c_hostStallEndMs = c_hostStallStartMs + 200;
+    constexpr std::uint64_t c_consumerPauseStartMs = 30000;
+    constexpr std::uint64_t c_consumerPauseEndMs = c_consumerPauseStartMs + 200;
+    constexpr std::uint64_t c_lastPacketMs = static_cast<std::uint64_t>(c_packetCount) * 10;
+    constexpr std::uint64_t c_maxDrainMs = c_lastPacketMs + 5000;
+    constexpr std::uint32_t c_stride = c_periodBytes + 8;
+    constexpr std::uint64_t c_ringCapacityFrames = 65536;
+
+    static_assert(c_totalFrames % c_periodFrames == 0);
+    static_assert(c_sampleRate / 100 == c_framesPerPacket);
+
+    FakeGuest guest;
+    auto ring = std::make_shared<S16LePcmRingSource>(PcmFormat{2, c_sampleRate}, c_ringCapacityFrames);
+    auto device = CreateDevice(guest, ring);
+    SetUpDevice(guest, *device, c_bufferFrames * 4, c_periodBytes, assertions);
+    QueueCaptureDescriptors(guest, static_cast<std::uint16_t>(c_rxBuffers), c_periodBytes);
+
+    CaptureEventScheduler scheduler;
+    std::uint64_t generation = device->CapturePacingGeneration();
+    std::uint64_t lastServiceMs = 0;
+    std::uint16_t nextAvailableIndex = static_cast<std::uint16_t>(c_rxBuffers);
+    std::uint16_t observedUsedIndex = 0;
+    std::uint64_t expectedDeliveredFrame = 0;
+    std::uint64_t dataEventSignals = 0;
+    std::uint64_t servicedDataEvents = 0;
+    std::uint64_t serviceCalls = 0;
+    std::uint64_t completedPeriods = 0;
+    std::uint64_t rxWaitCalls = 0;
+    std::uint64_t deferredDataWakeMilliseconds = 0;
+    std::uint64_t maxFramesFromOneService = 0;
+    std::size_t maxQueueDuringHostStall = 0;
+    bool sourceDataEventPending = false;
+    bool sawRxStarvation = false;
+    std::vector<std::uint16_t> consumerHeldBuffers;
+    std::vector<std::uint8_t> packet(static_cast<std::size_t>(c_framesPerPacket) * 4);
+
+    auto completeAndCheck = [&](const wsl::virtio_sound::native::CaptureServiceResult& result, std::uint64_t nowMs) {
+        Assert(result.m_frames >= 0, "Capture services never report a negative frame count", assertions);
+        Assert(
+            result.m_frames <= static_cast<int>(c_periodFrames),
+            "One scheduler service never completes more than one negotiated period",
+            assertions);
+        maxFramesFromOneService = (std::max)(maxFramesFromOneService, static_cast<std::uint64_t>(result.m_frames));
+        if (result.m_waitReason == wsl::virtio_sound::native::CaptureWaitReason::RxBuffer)
+        {
+            ++rxWaitCalls;
+            sawRxStarvation = true;
+        }
+        if (result.m_frames == 0)
+        {
+            return;
+        }
+
+        Assert(result.m_frames == static_cast<int>(c_periodFrames), "Clocked capture completes whole negotiated periods", assertions);
+        const std::uint16_t guestUsedIndex = static_cast<std::uint16_t>(Get(guest, 0x13000 + 2, 2));
+        Assert(
+            guestUsedIndex == static_cast<std::uint16_t>(observedUsedIndex + 1), "Each period publishes exactly one RX used entry", assertions);
+        const std::uint64_t usedEntry = 0x13000 + 4 + 8ULL * (observedUsedIndex % c_queueEntries);
+        const std::uint16_t descriptorHead = static_cast<std::uint16_t>(Get(guest, usedEntry, 4));
+        const std::uint32_t usedLength = static_cast<std::uint32_t>(Get(guest, usedEntry + 4, 4));
+        Assert((descriptorHead & 1U) == 0 && descriptorHead < c_rxBuffers * 2, "Used RX entry names one of the four guest buffers", assertions);
+        const std::uint16_t bufferSlot = static_cast<std::uint16_t>(descriptorHead / 2);
+        const std::uint64_t payloadAddress = 0x30000 + static_cast<std::uint64_t>(bufferSlot) * c_stride;
+        Assert(usedLength == c_stride, "A successful RX completion reports payload plus status", assertions);
+        Assert(Get(guest, payloadAddress + c_periodBytes, 4) == 0x8000, "Every delivered period has VIRTIO_SND_S_OK status", assertions);
+
+        bool sequenceMatches = true;
+        for (std::uint32_t frame = 0; frame < c_periodFrames; ++frame)
+        {
+            const std::uint64_t at = payloadAddress + static_cast<std::uint64_t>(frame) * 4;
+            const std::uint32_t left = static_cast<std::uint32_t>(guest.memory[static_cast<std::size_t>(at)]) |
+                                       (static_cast<std::uint32_t>(guest.memory[static_cast<std::size_t>(at + 1)]) << 8);
+            const std::uint32_t right = static_cast<std::uint32_t>(guest.memory[static_cast<std::size_t>(at + 2)]) |
+                                        (static_cast<std::uint32_t>(guest.memory[static_cast<std::size_t>(at + 3)]) << 8);
+            const std::uint32_t decodedSequence = left | (right << 16);
+            if (decodedSequence != static_cast<std::uint32_t>(expectedDeliveredFrame + frame))
+            {
+                sequenceMatches = false;
+                break;
+            }
+        }
+        Assert(sequenceMatches, "Every delivered stereo frame is ordered, unique, and from the producer ramp", assertions);
+
+        expectedDeliveredFrame += c_periodFrames;
+        ++completedPeriods;
+        observedUsedIndex = guestUsedIndex;
+        if (nowMs >= c_consumerPauseStartMs && nowMs < c_consumerPauseEndMs)
+        {
+            consumerHeldBuffers.push_back(bufferSlot);
+        }
+        else
+        {
+            RepostCaptureDescriptor(guest, bufferSlot, nextAvailableIndex, c_periodBytes);
+        }
+    };
+
+    auto serviceIfWoken = [&](std::uint64_t nowMs, bool urgentGuestWake) {
+        const std::uint64_t nowNs = nowMs * 1'000'000;
+        const bool dataEventIncluded = sourceDataEventPending && !scheduler.DeferSourceData(nowNs);
+        const bool deadlineDue = scheduler.WaitTimeoutMilliseconds(nowNs) == 0;
+        if (!urgentGuestWake && !dataEventIncluded && !deadlineDue)
+        {
+            return false;
+        }
+
+        const bool allowTransfer = scheduler.CanTransfer(nowNs, generation);
+        const std::uint64_t elapsedNs = (nowMs - lastServiceMs) * 1'000'000;
+        const auto result = device->ServiceCapture(elapsedNs, allowTransfer);
+        ++serviceCalls;
+        lastServiceMs = nowMs;
+        generation = result.m_generation;
+        scheduler.OnService(nowNs, result);
+        if (dataEventIncluded)
+        {
+            sourceDataEventPending = false;
+            ++servicedDataEvents;
+        }
+        completeAndCheck(result, nowMs);
+        return true;
+    };
+
+    for (std::uint64_t nowMs = 1; nowMs <= c_lastPacketMs; ++nowMs)
+    {
+        if (nowMs % 10 == 0 && nowMs / 10 <= c_packetCount)
+        {
+            const std::uint32_t firstFrame = static_cast<std::uint32_t>((nowMs / 10 - 1) * c_framesPerPacket);
+            for (std::uint32_t frame = 0; frame < c_framesPerPacket; ++frame)
+            {
+                EncodeSequenceFrame(firstFrame + frame, packet.data() + static_cast<std::size_t>(frame) * 4);
+            }
+            Assert(
+                ring->TryWriteFrames(ring->Generation(), packet.data(), c_framesPerPacket, packet.size()) == PcmRingWriteResult::Written,
+                "The virtual hardware source publishes each 10 ms packet without overflow",
+                assertions);
+            sourceDataEventPending = true; // Auto-reset SourceData signals coalesce while the host excludes this handle.
+            ++dataEventSignals;
+        }
+
+        const auto queued = ring->Snapshot().m_queuedFrames;
+        if (nowMs >= c_hostStallStartMs && nowMs < c_hostStallEndMs)
+        {
+            maxQueueDuringHostStall = (std::max)(maxQueueDuringHostStall, queued);
+            continue; // Simulate a bounded 200 ms host scheduling stall without advancing PCM by wall time.
+        }
+
+        bool urgentGuestWake = false;
+        if (nowMs == c_consumerPauseEndMs)
+        {
+            for (const auto slot : consumerHeldBuffers)
+            {
+                RepostCaptureDescriptor(guest, slot, nextAvailableIndex, c_periodBytes);
+            }
+            urgentGuestWake = !consumerHeldBuffers.empty();
+            consumerHeldBuffers.clear();
+        }
+
+        const std::uint64_t nowNs = nowMs * 1'000'000;
+        if (sourceDataEventPending && scheduler.DeferSourceData(nowNs))
+        {
+            ++deferredDataWakeMilliseconds;
+        }
+        (void)serviceIfWoken(nowMs, urgentGuestWake);
+    }
+
+    for (std::uint64_t nowMs = c_lastPacketMs + 1; nowMs <= c_maxDrainMs && ring->Snapshot().m_queuedFrames != 0; ++nowMs)
+    {
+        (void)serviceIfWoken(nowMs, false);
+    }
+
+    const auto finalRing = ring->Snapshot();
+    const auto diagnostics = device->GetDiagnosticsSnapshot();
+    Assert(c_lastPacketMs >= 60000, "The virtual scenario runs for at least sixty seconds of source time", assertions);
+    Assert(maxQueueDuringHostStall >= 20 * c_framesPerPacket, "The 200 ms host stall remains buffered in the source ring", assertions);
+    Assert(deferredDataWakeMilliseconds != 0 && servicedDataEvents < dataEventSignals, "Armed deadlines coalesce SourceData wakes", assertions);
+    Assert(sawRxStarvation && rxWaitCalls != 0, "The bounded guest consumer pause reaches the real no-RX wait path", assertions);
+    Assert(maxFramesFromOneService <= c_periodFrames, "The source backlog never causes multi-period completion bursts", assertions);
+    Assert(
+        expectedDeliveredFrame == c_totalFrames && finalRing.m_queuedFrames == 0,
+        "All produced source frames are delivered exactly once",
+        assertions);
+    Assert(
+        finalRing.m_framesWritten == c_totalFrames && finalRing.m_framesRead == c_totalFrames,
+        "Ring accounting has no lost or invented frames",
+        assertions);
+    Assert(
+        finalRing.m_overflowEvents == 0 && finalRing.m_underflowEvents == 0 && finalRing.m_sequenceFailures == 0,
+        "Virtual stalls and RX starvation produce neither overflow nor XRUN/underflow",
+        assertions);
+    Assert(
+        diagnostics.m_rxDataCompletions == completedPeriods && diagnostics.m_rxStatusOnlyCompletions == 0,
+        "Every completed period is successful data and no false IO_ERR/XRUN is reported",
+        assertions);
+    Assert(
+        diagnostics.m_captureMaximumRxOutstandingAvailable <= c_rxBuffers,
+        "The guest never exposes more RX credits than its four-period capture buffer",
+        assertions);
+    Assert(
+        static_cast<std::uint64_t>(observedUsedIndex) == completedPeriods && serviceCalls != 0,
+        "Guest used-ring progress matches the verified period count",
+        assertions);
+}
+
 } // namespace
 
 int main()
@@ -332,8 +574,9 @@ int main()
         int assertions = 0;
         TestConcurrentProducerAndCorePump(assertions);
         TestCoreUnderflowRemainsAnError(assertions);
-        std::cout << "PASS: ring/core integration " << assertions
-                  << " assertions; concurrent prebuffered capture has no false XRUN, true underflow remains IO_ERR.\n";
+        TestVirtualClockedRingAndSchedulerWithRxCredits(assertions);
+        std::cout << "PASS: ring/core integration "
+                  << assertions << " assertions; virtual paced capture survives host/RX pauses, concurrent capture has no false XRUN, true underflow remains IO_ERR.\n";
         return 0;
     }
     catch (const std::exception& error)

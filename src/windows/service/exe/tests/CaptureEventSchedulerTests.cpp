@@ -30,7 +30,14 @@ int main()
     result.m_frames = 480;
     result.m_waitReason = CaptureWaitReason::Progress;
     scheduler.OnService(0, result);
-    Require(scheduler.WaitTimeoutMilliseconds(0) == infinite, "empty source after completion waits for an event");
+    Require(scheduler.WaitTimeoutMilliseconds(0) == 10, "completion arms one deadline to coalesce early partial data");
+    Require(scheduler.DeferSourceData(0), "partial data cannot transfer before the completion deadline");
+    result.m_frames = 0;
+    result.m_waitReason = CaptureWaitReason::PacingDeadline;
+    scheduler.OnService(500'000, result);
+    Require(
+        scheduler.DeferSourceData(500'000) && scheduler.WaitTimeoutMilliseconds(500'000) == 10,
+        "Early urgent rescan with a partial tail preserves the one completion deadline");
     for (unsigned n = 1; n < 10; ++n)
     {
         const auto now = static_cast<std::uint64_t>(n) * 1'000'000;
@@ -45,14 +52,17 @@ int main()
     result.m_waitReason = CaptureWaitReason::RxBuffer;
     scheduler.OnService(10'000'000, result);
     Require(scheduler.WaitTimeoutMilliseconds(10'000'000) == infinite, "PCM without RX waits without spinning");
+    Require(scheduler.DeferSourceData(10'000'000), "source-only events cannot supply a missing RX buffer");
     result.m_waitReason = CaptureWaitReason::SourceData;
     result.m_moreSourceFrames = false;
     scheduler.OnService(10'000'000, result);
     Require(scheduler.WaitTimeoutMilliseconds(10'000'000) == infinite, "RX without PCM waits without spinning");
+    Require(!scheduler.DeferSourceData(10'000'000), "source starvation re-enables data events without a timer");
     result.m_waitReason = CaptureWaitReason::Readiness;
     scheduler.OnService(10'000'000, result);
     Require(scheduler.WaitTimeoutMilliseconds(10'000'000) == infinite, "pending START is awakened by readiness or failure");
     Require(scheduler.CanTransfer(11'000'000, 2), "new generation discards old deadline state");
+    Require(!scheduler.DeferSourceData(11'000'000), "new generation clears deferred RX/data state");
     result.m_generation = 2;
     result.m_sourceClocked = false;
     result.m_waitReason = CaptureWaitReason::PacingDeadline;
@@ -93,5 +103,19 @@ int main()
     Require(jittered.CanTransfer(maximumTime - 1, 4), "late transfer remains permitted near clock limit");
     jittered.OnService(maximumTime - 1, result);
     Require(jittered.WaitTimeoutMilliseconds(maximumTime) == infinite - 1, "saturated clock cannot cause zero-timeout spinning");
+
+    CaptureEventScheduler partialStart;
+    result.m_generation = 5;
+    result.m_frames = 0;
+    result.m_periodFrames = 2048;
+    result.m_waitReason = CaptureWaitReason::SourceData;
+    result.m_moreSourceFrames = false;
+    partialStart.OnService(10'000'000, result);
+    result.m_frames = 2048;
+    result.m_waitReason = CaptureWaitReason::Progress;
+    partialStart.OnService(50'000'000, result);
+    Require(!partialStart.CanTransfer(60'000'000, 5), "first partial packet must not anchor the completion phase");
+    Require(
+        partialStart.WaitTimeoutMilliseconds(50'000'000) == 43, "first actual completion owns one full negotiated-period guard");
     std::cout << "PASS: idle/event waits, duplicate notifications, completion rate guard and synthetic deadline\n";
 }

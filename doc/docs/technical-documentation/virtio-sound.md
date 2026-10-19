@@ -124,8 +124,9 @@ This is a throughput constraint, not a guarantee against host scheduling stalls.
 
 ## Capture scheduling and performance diagnostics
 
-The HDV child waits on stop, parent exit, and a coalescing capture event. Source
-data/readiness/failure and guest RX/state changes signal that event. RX queue
+The HDV child waits on stop, parent exit, stop preparation, and coalescing capture
+events. Source data has a separate event from readiness/failure and guest RX/state
+changes so that only data arrivals can be deferred. RX queue
 notifications remain enabled; HDV callbacks signal the owner and never transfer
 PCM themselves. A shared event owner remains alive with pinned callback state.
 The core services pending START and failure transitions even when PCM transfer
@@ -136,7 +137,8 @@ Each service transfers at most one negotiated period. An explicit completion
 deadline prevents repeated events from granting extra sample credit. Sub-period
 lateness advances the previous absolute deadline to avoid cumulative scheduling
 drift; a delay of a full period rebases the phase rather than replaying all missed
-slots. Runnable backlog arms one deadline; synthetic input additionally uses
+slots. A completed period arms one deadline to coalesce incoming partial packets;
+an empty rescan disarms it. Runnable backlog also arms a deadline; synthetic input uses
 deadlines to advance its sample clock. This is a bounded completion-rate policy,
 not proof that an ALSA application consumed the previous period. The conservative
 10 ms configuration capacity check remains unchanged. Scheduling stalls can
@@ -198,6 +200,34 @@ idle waits, and synthetic deadlines. Local byte-pipe tests cover partial frames,
 duplex progress, timeout, cancellation, and reuse. These checks do not exercise
 the complete authenticated process graph or physical endpoint loss. Validate
 those separately before claiming end-to-end performance gains.
+
+## Capture queue observability and source wake deferral
+
+Source-data notifications use a separate auto-reset event from source state and
+guest notifications. The pump excludes only the data event while a completion
+deadline is pending or a clocked source is waiting for RX buffers. State changes,
+failure, guest queue updates, shutdown, and stop preparation remain waitable.
+Deferred data stays signaled across early urgent rescans. The first successful
+transfer anchors the pacing phase; a partial startup packet does not. A completion
+arms one deadline even if the source tail is partial; an empty rescan disarms it.
+This is a completion guard, not recurring idle polling.
+
+The core emits six event-weighted backlog buckets in negotiated-period units:
+zero, less than one, one to less than two, two to less than four, four to less than
+eight, and eight or more. Samples occur once per ready, running service before
+transfer. They are not time-weighted percentiles or end-to-end latency. Normal
+PCM_RELEASE status-only returns use `CaptureReleaseBuffer`; actual capture errors
+retain `CaptureStatusError`. Wire status and descriptor handling are unchanged.
+
+The independent Python probe's optional `--telemetry` output adds negotiated ALSA
+parameters and bounded per-channel signal summaries. It retains no audio file,
+and its extra observer work must be included in performance comparisons.
+
+Completion rate, per-service frame bounds, and ring limits are unchanged. In
+particular, this change does not accelerate delivery to repay long scheduling
+stalls: source occupancy alone cannot establish safe space in the guest ALSA
+ring. A retained backlog remains a latency limitation requiring separate guest
+consumption and physical endpoint validation.
 
 ## RX doorbell shutdown ordering
 

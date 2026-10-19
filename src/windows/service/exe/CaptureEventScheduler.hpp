@@ -8,8 +8,10 @@
 namespace wsl::virtio_sound::process_host::detail {
 
 // A completion-rate guard, not a polling cadence. Hardware capture has no
-// timer while waiting for data, RX, or readiness. Deferred runnable work arms
-// one deadline. Synthetic sources also need a deadline to produce samples.
+// repeating timer while waiting for data, RX, or readiness. A successful
+// transfer arms one completion deadline, coalescing source arrivals until it
+// expires. A rescan with no data disarms it. Synthetic sources also need a
+// deadline to produce samples.
 class CaptureEventScheduler final
 {
 public:
@@ -20,6 +22,8 @@ public:
             m_generation = generation;
             m_nextAllowed = now;
             m_armed = false;
+            m_waitingForRx = false;
+            m_hasCompletion = false;
         }
         return now >= m_nextAllowed;
     }
@@ -28,9 +32,13 @@ public:
     {
         (void)CanTransfer(startedAt, result.m_generation);
         using Reason = native::CaptureWaitReason;
+        // More source samples cannot supply a missing guest buffer. Guest
+        // queue/state and source failure events still force an immediate scan.
+        m_waitingForRx = result.m_sourceClocked && result.m_waitReason == Reason::RxBuffer;
         if (result.m_waitReason == Reason::Idle || result.m_waitReason == Reason::Readiness || result.m_waitReason == Reason::Failed)
         {
             m_armed = false;
+            m_hasCompletion = false;
             return;
         }
         if (result.m_frames > 0)
@@ -41,8 +49,12 @@ public:
             // error and eventually fills a source-clocked capture queue.
             // Rebase after a whole missed period instead of replaying an
             // unbounded backlog of deadlines after a host scheduling stall.
-            const auto base = startedAt >= m_nextAllowed && startedAt - m_nextAllowed < duration ? m_nextAllowed : startedAt;
+            // The first data notification can precede the first full period.
+            // Anchor the phase to the first actual completion, not that early
+            // partial-packet rescan, or every deadline can precede usable data.
+            const auto base = m_hasCompletion && startedAt >= m_nextAllowed && startedAt - m_nextAllowed < duration ? m_nextAllowed : startedAt;
             m_nextAllowed = Add(base, duration);
+            m_hasCompletion = true;
         }
         if (!result.m_sourceClocked)
         {
@@ -54,8 +66,8 @@ public:
         }
         else
         {
-            m_armed = result.m_moreSourceFrames &&
-                (result.m_waitReason == Reason::Progress || result.m_waitReason == Reason::PacingDeadline);
+            m_armed = result.m_waitReason == Reason::Progress ||
+                      ((m_armed || result.m_moreSourceFrames) && result.m_waitReason == Reason::PacingDeadline);
         }
     }
 
@@ -73,6 +85,13 @@ public:
         const auto delta = m_nextAllowed - now;
         const auto milliseconds = delta / 1'000'000 + (delta % 1'000'000 != 0);
         return milliseconds >= infinite ? infinite - 1 : static_cast<std::uint32_t>(milliseconds);
+    }
+
+    // Data already available cannot advance the completion deadline. Keep
+    // source state, guest state, and shutdown events in the host wait set.
+    bool DeferSourceData(std::uint64_t now) const noexcept
+    {
+        return m_waitingForRx || (m_armed && now < m_nextAllowed);
     }
 
 private:
@@ -94,5 +113,7 @@ private:
     std::uint64_t m_generation{};
     std::uint64_t m_nextAllowed{};
     bool m_armed{};
+    bool m_waitingForRx{};
+    bool m_hasCompletion{};
 };
 } // namespace wsl::virtio_sound::process_host::detail
