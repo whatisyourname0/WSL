@@ -231,11 +231,77 @@ void RepostCaptureDescriptor(FakeGuest& guest, std::uint16_t bufferSlot, std::ui
     PublishHead(guest, 0x12000, ringSlot, availableIndex, requestIndex);
 }
 
-std::unique_ptr<VirtioSoundDevice> CreateDevice(FakeGuest& guest, const std::shared_ptr<S16LePcmRingSource>& ring)
+std::unique_ptr<VirtioSoundDevice> CreateDevice(FakeGuest& guest, const std::shared_ptr<wsl::virtio_sound::native::PcmSource>& ring)
 {
     GuestMemoryCallbacks memory{&guest, &ReadGuest, &WriteGuest};
     InterruptCallbacks interrupts{&guest, &DeliverMsi, nullptr};
     return std::make_unique<VirtioSoundDevice>(memory, interrupts, ring, PcmFormat{2, 48000});
+}
+
+// A hardware-clocked adapter around the real ring. The plain ring deliberately
+// leaves AvailableFrames unknown; using it directly exercises synthetic pacing.
+class ClockedRingSource final : public wsl::virtio_sound::native::PcmSource
+{
+public:
+    explicit ClockedRingSource(std::shared_ptr<S16LePcmRingSource> ring) : m_ring(std::move(ring)) {}
+    bool ReadFrames(std::uint32_t frames, std::uint8_t* destination, std::size_t bytes) noexcept override
+    {
+        return m_ring->ReadFrames(frames, destination, bytes);
+    }
+    void Reset() noexcept override { m_ring->Reset(); }
+    std::optional<std::uint32_t> AvailableFrames() const noexcept override
+    {
+        if (m_hiddenQueries != 0)
+        {
+            --m_hiddenQueries;
+            return m_visibleFrames;
+        }
+        return static_cast<std::uint32_t>(m_ring->Snapshot().m_queuedFrames);
+    }
+    void HideNextQueries(unsigned count, std::uint32_t visibleFrames) noexcept
+    {
+        m_hiddenQueries = count;
+        m_visibleFrames = visibleFrames;
+    }
+
+private:
+    std::shared_ptr<S16LePcmRingSource> m_ring;
+    mutable unsigned m_hiddenQueries{};
+    std::uint32_t m_visibleFrames{};
+};
+
+void TestSourceArrivalBetweenServiceSnapshots(std::uint32_t initialFrames, int& assertions)
+{
+    using wsl::virtio_sound::native::CaptureWaitReason;
+    using wsl::virtio_sound::process_host::detail::CaptureEventScheduler;
+    constexpr std::uint32_t period = 2048;
+    FakeGuest guest;
+    auto ring = std::make_shared<S16LePcmRingSource>(PcmFormat{2, 48000}, period * 4);
+    auto source = std::make_shared<ClockedRingSource>(ring);
+    auto device = CreateDevice(guest, source);
+    SetUpDevice(guest, *device, period * 4 * 4, period * 4, assertions);
+    QueueCaptureDescriptors(guest, 4, period * 4);
+    std::vector<std::uint8_t> packet(period * 4);
+    FillStereoFrames(0, period, packet.data());
+    Assert(ring->TryWriteFrames(ring->Generation(), packet.data(), period, packet.size()) == PcmRingWriteResult::Written,
+        "Race fixture publishes one complete period", assertions);
+    // Observe less than one period for the histogram and pump budget, then expose the
+    // producer's arrival to the post-service snapshot, without a new RX kick.
+    source->HideNextQueries(2, initialFrames);
+    const auto raced = device->ServiceCapture(0, true);
+    Assert(raced.m_frames == 0 && raced.m_sourceAvailableFrames == period,
+        "Producer arrival crosses the period threshold after the pump budget snapshot", assertions);
+    CaptureEventScheduler scheduler;
+    scheduler.OnService(0, raced);
+    Assert(raced.m_waitReason == CaptureWaitReason::SourceData && !scheduler.DeferSourceData(0),
+        "A source snapshot race must not suppress data while already-posted RX buffers wait", assertions);
+    const auto resumed = device->ServiceCapture(0, scheduler.CanTransfer(0, raced.m_generation));
+    Assert(resumed.m_frames == static_cast<int>(period) && Get(guest, 0x13000 + 2, 2) == 1,
+        "A subsequent source wake completes the existing RX buffer without another guest kick", assertions);
+    Assert(std::equal(packet.begin(), packet.end(), guest.memory.begin() + 0x30000),
+        "Resumed capture preserves every PCM byte", assertions);
+    Assert(ring->Snapshot().m_queuedFrames == 0 && device->GetDiagnosticsSnapshot().m_rxStatusOnlyCompletions == 0,
+        "Snapshot race causes neither queued residue nor a false XRUN", assertions);
 }
 
 void TestConcurrentProducerAndCorePump(int& assertions)
@@ -365,7 +431,9 @@ void TestVirtualClockedRingAndSchedulerWithRxCredits(int& assertions)
     constexpr std::uint64_t c_hostStallStartMs = 5000;
     constexpr std::uint64_t c_hostStallEndMs = c_hostStallStartMs + 200;
     constexpr std::uint64_t c_consumerPauseStartMs = 30000;
-    constexpr std::uint64_t c_consumerPauseEndMs = c_consumerPauseStartMs + 200;
+    // Exceed five periods even at the least favorable completion phase, so
+    // four held RX buffers are exhausted before the guest resumes.
+    constexpr std::uint64_t c_consumerPauseEndMs = c_consumerPauseStartMs + 300;
     constexpr std::uint64_t c_lastPacketMs = static_cast<std::uint64_t>(c_packetCount) * 10;
     constexpr std::uint64_t c_maxDrainMs = c_lastPacketMs + 5000;
     constexpr std::uint32_t c_stride = c_periodBytes + 8;
@@ -376,7 +444,8 @@ void TestVirtualClockedRingAndSchedulerWithRxCredits(int& assertions)
 
     FakeGuest guest;
     auto ring = std::make_shared<S16LePcmRingSource>(PcmFormat{2, c_sampleRate}, c_ringCapacityFrames);
-    auto device = CreateDevice(guest, ring);
+    auto source = std::make_shared<ClockedRingSource>(ring);
+    auto device = CreateDevice(guest, source);
     SetUpDevice(guest, *device, c_bufferFrames * 4, c_periodBytes, assertions);
     QueueCaptureDescriptors(guest, static_cast<std::uint16_t>(c_rxBuffers), c_periodBytes);
 
@@ -574,6 +643,8 @@ int main()
         int assertions = 0;
         TestConcurrentProducerAndCorePump(assertions);
         TestCoreUnderflowRemainsAnError(assertions);
+        TestSourceArrivalBetweenServiceSnapshots(0, assertions);
+        TestSourceArrivalBetweenServiceSnapshots(2047, assertions);
         TestVirtualClockedRingAndSchedulerWithRxCredits(assertions);
         std::cout << "PASS: ring/core integration "
                   << assertions << " assertions; virtual paced capture survives host/RX pauses, concurrent capture has no false XRUN, true underflow remains IO_ERR.\n";

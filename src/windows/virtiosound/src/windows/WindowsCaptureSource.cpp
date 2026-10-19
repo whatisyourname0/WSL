@@ -1208,6 +1208,10 @@ private:
             }
             if (writeResult != PcmRingWriteResult::Written)
             {
+                // Failure-only metadata distinguishes ring exhaustion from an
+                // IPC validation failure without exposing any captured samples.
+                detail::TraceAudioSource(L"RingWriteRejected", static_cast<std::uint64_t>(writeResult), m_ring.Snapshot().m_queuedFrames);
+                detail::TraceAudioSource(L"RingWriteRejectedFrames", frames);
                 return false;
             }
             std::uint32_t periodFrames = 0U;

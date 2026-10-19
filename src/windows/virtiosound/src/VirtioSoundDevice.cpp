@@ -1188,7 +1188,7 @@ public:
         }
     }
 
-    int PumpCapture(int frameBudget)
+    int PumpCapture(int frameBudget, bool* rxUnavailable = nullptr)
     {
         if (frameBudget < 0 || frameBudget > static_cast<int>(c_maxTransferBytes / m_frameBytes))
         {
@@ -1200,7 +1200,7 @@ public:
         int completed = 0;
         try
         {
-            completed = PumpCaptureCore(frameBudget);
+            completed = PumpCaptureCore(frameBudget, rxUnavailable);
         }
         catch (...)
         {
@@ -1215,7 +1215,7 @@ public:
         return completed;
     }
 
-    int PumpCaptureCore(int frameBudget)
+    int PumpCaptureCore(int frameBudget, bool* rxUnavailable)
     {
         if (!Ready() || !IsRunning())
         {
@@ -1302,6 +1302,10 @@ public:
                 ObserveRxBacklog();
                 if (available == nullptr)
                 {
+                    if (rxUnavailable != nullptr)
+                    {
+                        *rxUnavailable = true;
+                    }
                     break;
                 }
                 if (chain.m_capacity < 8)
@@ -1353,9 +1357,13 @@ public:
     }
 
     int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds, bool allowTransfer = true,
-        std::uint32_t frameLimit = (std::numeric_limits<std::uint32_t>::max)())
+        std::uint32_t frameLimit = (std::numeric_limits<std::uint32_t>::max)(), bool* rxUnavailable = nullptr)
     {
         std::lock_guard<std::recursive_mutex> lock(m_gate);
+        if (rxUnavailable != nullptr)
+        {
+            *rxUnavailable = false;
+        }
         Increment(m_captureElapsedPumpCalls);
         Accumulate(m_captureElapsedNanoseconds, elapsedNanoseconds);
         m_captureMaximumElapsedNanoseconds = (std::max)(m_captureMaximumElapsedNanoseconds, elapsedNanoseconds);
@@ -1404,7 +1412,7 @@ public:
             {
                 return 0;
             }
-            return PumpCapture(0);
+            return PumpCapture(0, rxUnavailable);
         }
         if (!m_queues[3].m_enabled)
         {
@@ -1438,7 +1446,7 @@ public:
                     maximumBurstFrames = (std::min)(maximumBurstFrames, bufferFrames - periodFrames);
                 }
                 const std::uint32_t availableBudget = (std::min)(*availableFrames, maximumBurstFrames);
-                return PumpCapture(static_cast<int>((std::min)(availableBudget, frameLimit)));
+                return PumpCapture(static_cast<int>((std::min)(availableBudget, frameLimit)), rxUnavailable);
             }
         }
 
@@ -1458,7 +1466,7 @@ public:
             return 0;
         }
         int budget = static_cast<int>(std::min(m_elapsedFrameCredit, static_cast<long double>((std::min)(maxFrames, frameLimit))));
-        int completed = PumpCapture(budget);
+        int completed = PumpCapture(budget, rxUnavailable);
         m_elapsedFrameCredit = std::max(0.0L, m_elapsedFrameCredit - completed);
         return completed;
     }
@@ -1480,7 +1488,8 @@ public:
                                                              : 5;
             Increment(m_captureBacklogSamples[bucket]);
         }
-        result.m_frames = PumpCaptureElapsed(elapsedNanoseconds, allowTransfer, m_periodBytes / m_frameBytes);
+        bool rxUnavailable = false;
+        result.m_frames = PumpCaptureElapsed(elapsedNanoseconds, allowTransfer, m_periodBytes / m_frameBytes, &rxUnavailable);
         result.m_generation = m_pacingGeneration;
         result.m_periodFrames = m_periodBytes / m_frameBytes;
         result.m_sampleRate = m_format.m_sampleRate;
@@ -1514,7 +1523,10 @@ public:
         }
         else
         {
-            result.m_waitReason = CaptureWaitReason::RxBuffer;
+            // Source data can arrive between the budget and final snapshots.
+            // Only an observed empty RX queue permits waiting for a guest kick;
+            // a retained descriptor must still be woken by the source event.
+            result.m_waitReason = rxUnavailable ? CaptureWaitReason::RxBuffer : CaptureWaitReason::SourceData;
         }
         return result;
     }
