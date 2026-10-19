@@ -10,6 +10,7 @@ on:
       - 'test/windows/common/TestClass.h'
       - 'test/windows/CMakeLists.txt'
       - 'packages.config'
+      - 'nuget.config'
       - '.pipelines/build-job.yml'
       - 'tools/test/virtio-sound-alsa-probe/**'
       - '.github/workflows/virtio-sound-offline-tests.yml'
@@ -50,10 +51,13 @@ jobs:
       - name: Configure standalone test build
         run: |
           $version = (Select-Xml -Path packages.config -XPath '/packages/package[@id="Microsoft.Taef"]/@version').Node.Value
-          $package = "${env:RUNNER_TEMP}\taef.zip"
-          Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.taef/$version/microsoft.taef.$version.nupkg" -OutFile $package
-          Expand-Archive $package -DestinationPath "${env:RUNNER_TEMP}\taef"
-          cmake -S src/windows/virtiosound -B "${env:RUNNER_TEMP}\wsl-virtio-sound" -A x64 -DWSL_VIRTIO_SOUND_BUILD_TESTS=ON -DWSL_VIRTIO_SOUND_BUILD_TAEF_TESTS=ON "-DWSL_VIRTIO_SOUND_TAEF_ROOT=${env:RUNNER_TEMP}\taef"
+          # Match cmake/findNuget.cmake and use the repository's package feed.
+          $nuget = "${env:RUNNER_TEMP}\nuget.exe"
+          Invoke-WebRequest https://dist.nuget.org/win-x86-commandline/v5.10.0/nuget.exe -OutFile $nuget
+          if ((Get-FileHash $nuget -Algorithm SHA256).Hash -ne '852b71cc8c8c2d40d09ea49d321ff56fd2397b9d6ea9f96e532530307bbbafd3') { throw 'NuGet tool hash mismatch' }
+          & $nuget install Microsoft.Taef -Version $version -ConfigFile nuget.config -OutputDirectory "${env:RUNNER_TEMP}\taef" -ExcludeVersion -NonInteractive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake -S src/windows/virtiosound -B "${env:RUNNER_TEMP}\wsl-virtio-sound" -A x64 -DWSL_VIRTIO_SOUND_BUILD_TESTS=ON -DWSL_VIRTIO_SOUND_BUILD_TAEF_TESTS=ON "-DWSL_VIRTIO_SOUND_TAEF_ROOT=${env:RUNNER_TEMP}\taef\Microsoft.Taef"
 
       - name: Build standalone tests
         run: cmake --build "${env:RUNNER_TEMP}\wsl-virtio-sound" --config Release --parallel 2
@@ -63,5 +67,5 @@ jobs:
 
       - name: Run the repository TAEF test adapter without WSL setup
         run: |
-          & "${env:RUNNER_TEMP}\taef\build\Binaries\x64\TE.exe" "${env:RUNNER_TEMP}\wsl-virtio-sound\taef-tests\Release\wsl_virtio_sound_taef_tests.dll" /name:*VirtioSoundUnitTests* /sessionTimeout:0:05:00
+          & "${env:RUNNER_TEMP}\taef\Microsoft.Taef\build\Binaries\x64\TE.exe" "${env:RUNNER_TEMP}\wsl-virtio-sound\taef-tests\Release\wsl_virtio_sound_taef_tests.dll" /name:*VirtioSoundUnitTests* /sessionTimeout:0:05:00
           exit $LASTEXITCODE
