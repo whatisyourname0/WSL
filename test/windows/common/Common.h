@@ -418,6 +418,8 @@ std::pair<wil::unique_handle, wil::unique_handle> CreateSubprocessPipe(
 
 std::pair<DWORD, DWORD> GetServiceState(SC_HANDLE service);
 
+bool WaitForServiceState(SC_HANDLE service, DWORD state, DWORD previousPid);
+
 DWORD
 LxsstuLaunchWsl(
     _In_opt_ LPCWSTR Arguments,
@@ -636,6 +638,8 @@ std::string EscapeString(const std::string& Input);
 void VerifyPatternMatch(const std::string& Content, const std::string& Pattern);
 
 std::filesystem::path GetTestImagePath(std::string_view imageName);
+
+std::filesystem::path GetInstalledWslToolsPath();
 
 void LoadTestImage(IWSLCSession& session, std::string_view imageName);
 
