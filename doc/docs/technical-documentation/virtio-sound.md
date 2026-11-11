@@ -192,7 +192,7 @@ them. Pipe cancellation drains outstanding I/O before reuse. A failed write can
 leave a partial wire frame, so the pipe session must be discarded even though
 the writer's buffer and event can be reused with a fresh pipe.
 
-The [comparison benchmark](../../../src/windows/virtiosound/benchmarks/README.md)
+The [comparison benchmark](https://github.com/microsoft/WSL/blob/master/src/windows/virtiosound/benchmarks/README.md)
 builds one harness against baseline and candidate core sources. Its allocation
 counts and the deterministic scheduler simulation do not measure microphone
 latency, host CPU consumption, or timer behavior under VM load. The event
