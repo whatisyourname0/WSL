@@ -6,6 +6,7 @@
 
 #include "AudioIpcCodec.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -29,9 +30,12 @@ using wsl::virtio_sound::audio_ipc::Error;
 using wsl::virtio_sound::audio_ipc::Header;
 using wsl::virtio_sound::audio_ipc::Message;
 using wsl::virtio_sound::audio_ipc::MessageType;
+using wsl::virtio_sound::audio_ipc::OwnedWireMessage;
 using wsl::virtio_sound::audio_ipc::ParseServerIdentityPayload;
 using wsl::virtio_sound::audio_ipc::ParseStartPayload;
+using wsl::virtio_sound::audio_ipc::PreparePcmMessage;
 using wsl::virtio_sound::audio_ipc::ValidateMessage;
+using wsl::virtio_sound::audio_ipc::ValidateWireMessage;
 
 int failures = 0;
 
@@ -331,6 +335,101 @@ void TestMaximumPayloadBoundaries()
         "one-over-limit endpoint is rejected");
 }
 
+void TestWireBufferReuseAndExactBytes()
+{
+    Error error = Error::None;
+    std::vector<std::uint8_t> wire;
+    Message maximumPcm = MakeMessage(
+        MessageType::Pcm,
+        1U,
+        1U,
+        std::vector<std::uint8_t>(c_maxPayloadBytes, static_cast<std::uint8_t>(0x5AU)));
+
+    Check(EncodeMessage(maximumPcm, wire, error), "maximum PCM message warms a reusable wire buffer");
+    const std::uint8_t* const warmedData = wire.data();
+    const std::size_t warmedCapacity = wire.capacity();
+    Check(wire.size() == c_headerBytes + c_maxPayloadBytes, "warm buffer contains the full bounded message");
+
+    const Message hello = MakeMessage(MessageType::Hello, 0U, 1U);
+    const std::vector<std::uint8_t> expectedHello{
+        0x57U, 0x41U, 0x53U, 0x31U, 0x02U, 0x00U, 0x01U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
+    const Message pcm = MakeMessage(
+        MessageType::Pcm,
+        0x0102030405060708ULL,
+        0x1112131415161718ULL,
+        {0xA1U, 0xB2U, 0xC3U, 0xD4U});
+    const std::vector<std::uint8_t> expectedPcm{
+        0x57U, 0x41U, 0x53U, 0x31U, 0x02U, 0x00U, 0x07U, 0x00U,
+        0x04U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x08U, 0x07U, 0x06U, 0x05U, 0x04U, 0x03U, 0x02U, 0x01U,
+        0x18U, 0x17U, 0x16U, 0x15U, 0x14U, 0x13U, 0x12U, 0x11U,
+        0xA1U, 0xB2U, 0xC3U, 0xD4U};
+
+    Message aliasOutput = pcm;
+    Check(
+        EncodeMessage(aliasOutput, aliasOutput.m_payload, error) && aliasOutput.m_payload == expectedPcm,
+        "encoding into the message payload preserves the original payload bytes");
+
+    std::size_t storageChanges = 0U;
+    constexpr std::size_t c_repetitions = 128U;
+    for (std::size_t iteration = 0U; iteration < c_repetitions; ++iteration)
+    {
+        Check(EncodeMessage(hello, wire, error), "small message encodes into the warmed wire buffer");
+        Check(wire == expectedHello, "shorter message has exact bytes and no stale payload");
+        if (wire.data() != warmedData || wire.capacity() != warmedCapacity)
+        {
+            ++storageChanges;
+        }
+
+        Check(EncodeMessage(pcm, wire, error), "PCM fixture encodes into the warmed wire buffer");
+        Check(wire == expectedPcm, "reused buffer preserves exact PCM wire bytes");
+        if (wire.data() != warmedData || wire.capacity() != warmedCapacity)
+        {
+            ++storageChanges;
+        }
+    }
+    Check(storageChanges == 0U, "128 alternating control and PCM encodes cause zero wire-buffer reallocations after warmup");
+}
+
+void TestPreparedPcmWireValidationAndInPlaceFinalization()
+{
+    OwnedWireMessage prepared{};
+    Error error = Error::None;
+    Check(PreparePcmMessage(7U, 19U, 128U, prepared, error), "PCM wire frame reserves a payload in one buffer");
+    for (std::size_t index = 0U; index < 128U; ++index)
+    {
+        prepared.m_bytes[c_headerBytes + index] = static_cast<std::uint8_t>((index * 13U) + 0x21U);
+    }
+    const std::vector<std::uint8_t> expectedPayload(
+        prepared.m_bytes.begin() + static_cast<std::ptrdiff_t>(c_headerBytes),
+        prepared.m_bytes.begin() + static_cast<std::ptrdiff_t>(c_headerBytes + 64U));
+    Check(PreparePcmMessage(7U, 19U, 64U, prepared, error), "PCM finalization shrinks the header and payload in place");
+    Check(prepared.m_bytes.size() == c_headerBytes + 64U, "finalized PCM frame has the exact wire length");
+    Check(ValidateWireMessage(prepared.m_bytes.data(), prepared.m_bytes.size(), error), "exact prepared PCM wire frame validates without decoding allocation");
+    Check(
+        std::equal(expectedPayload.begin(), expectedPayload.end(), prepared.m_bytes.begin() + static_cast<std::ptrdiff_t>(c_headerBytes)),
+        "shrinking the prepared PCM frame preserves captured bytes");
+
+    const Message semantic = MakeMessage(MessageType::Pcm, 7U, 19U, expectedPayload);
+    std::vector<std::uint8_t> encoded;
+    Check(EncodeMessage(semantic, encoded, error), "semantic PCM fixture encodes for prepared-wire comparison");
+    Check(encoded == prepared.m_bytes, "prepared PCM bytes match the canonical encoder exactly");
+
+    const std::vector<std::uint8_t> preserved = prepared.m_bytes;
+    Check(!PreparePcmMessage(7U, 20U, 0U, prepared, error) && error == Error::InvalidPayloadSize, "empty PCM frame preparation is rejected");
+    Check(prepared.m_bytes == preserved, "invalid PCM preparation leaves the owned wire bytes unchanged");
+
+    std::vector<std::uint8_t> malformed = preserved;
+    malformed.push_back(0U);
+    Check(!ValidateWireMessage(malformed.data(), malformed.size(), error) && error == Error::TrailingBytes, "wire validator rejects trailing bytes");
+    malformed = preserved;
+    malformed.pop_back();
+    Check(!ValidateWireMessage(malformed.data(), malformed.size(), error) && error == Error::TruncatedMessage, "wire validator rejects truncated payloads");
+}
+
 void TestPcmFaultAndControlMessages()
 {
     Error error = Error::None;
@@ -507,6 +606,8 @@ int main()
     TestServerIdentityBootstrap();
     TestStartRoundTripAndUtf16Validation();
     TestMaximumPayloadBoundaries();
+    TestWireBufferReuseAndExactBytes();
+    TestPreparedPcmWireValidationAndInPlaceFinalization();
     TestPcmFaultAndControlMessages();
     TestMalformedHeadersAndLengths();
     TestMalformedPayloadsAndExactMessageSizes();

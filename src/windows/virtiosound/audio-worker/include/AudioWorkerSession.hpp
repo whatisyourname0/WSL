@@ -51,14 +51,36 @@ enum class AudioWorkerPollResult
 };
 
 // Emit is called synchronously on the adapter's control thread. Implementations
-// must serialize/write the message before returning, must not retain its
-// reference, and must not reenter AudioWorkerSession. False means that the
-// transport is disconnected. The adapter never queues outbound messages.
+// must accept a bounded copy of the message before returning, must not retain
+// its reference, and must not reenter AudioWorkerSession. False means that the
+// transport has no capacity or is disconnected.
 class IAudioWorkerMessageEmitter
 {
 public:
     virtual ~IAudioWorkerMessageEmitter() = default;
     virtual bool Emit(const audio_ipc::Message& message) noexcept = 0;
+
+    // Accepts a fully framed bounded message. Implementations may exchange a
+    // reusable wire buffer with the caller on success. The default keeps older
+    // emitters source-compatible and decodes into the existing bounded-copy
+    // path. A false result must leave the supplied frame unchanged.
+    virtual bool EmitPrepared(audio_ipc::OwnedWireMessage& message) noexcept
+    {
+        try
+        {
+            audio_ipc::Message decoded;
+            audio_ipc::Error error = audio_ipc::Error::None;
+            if (!audio_ipc::DecodeMessage(message.m_bytes.data(), message.m_bytes.size(), decoded, error))
+            {
+                return false;
+            }
+            return Emit(decoded);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
 };
 
 // A single-threaded worker-process session adapter. Call HandleControl,
@@ -86,10 +108,13 @@ public:
     AudioWorkerSessionState HandleControl(const audio_ipc::Message& request, IAudioWorkerMessageEmitter& emitter) noexcept;
 
     // Poll does not wait for new PCM and emits no more than one PCM or Fault
-    // response, with PCM capped at 48,000 frames / 192,000 bytes. It can block
-    // while the synchronous emitter writes or while failure cleanup joins the
-    // capture worker; a future process supervisor must enforce a hard deadline.
+    // response, with PCM capped at 48,000 frames / 192,000 bytes. Failure cleanup
+    // may join the capture worker on this owner thread.
     AudioWorkerPollResult Poll(IAudioWorkerMessageEmitter& emitter) noexcept;
+
+    // Opaque native wait handle for capture queue data or a terminal capture
+    // failure. It is owned by the AudioWorkerSession and valid for its lifetime.
+    void* CaptureActivityWaitHandle() const noexcept;
 
     // Call after pipe/transport loss. It stops the worker and never reopens an
     // endpoint. Stop joins the existing capture thread and has no hard deadline;
@@ -110,6 +135,7 @@ private:
     AudioWorkerFaultCode MapCaptureError(CaptureErrorCode code) const noexcept;
 
     AudioCaptureWorker m_worker;
+    audio_ipc::OwnedWireMessage m_pcmOutput;
     AudioWorkerSessionState m_state{AudioWorkerSessionState::AwaitingHello};
     std::uint64_t m_lastInboundSequence{};
     std::uint64_t m_lastOutboundSequence{};

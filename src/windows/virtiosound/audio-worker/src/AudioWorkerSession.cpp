@@ -147,6 +147,11 @@ AudioWorkerSessionState AudioWorkerSession::State() const noexcept
     return m_state;
 }
 
+void* AudioWorkerSession::CaptureActivityWaitHandle() const noexcept
+{
+    return m_worker.ActivityWaitHandle();
+}
+
 bool AudioWorkerSession::IsImmediatelyAfter(std::uint64_t previous, std::uint64_t candidate) noexcept
 {
     return previous != c_maximumSequence && candidate == previous + 1U;
@@ -302,6 +307,7 @@ AudioWorkerPollResult AudioWorkerSession::Poll(IAudioWorkerMessageEmitter& emitt
     {
         return AudioWorkerPollResult::NoData;
     }
+    m_pcmOutput.m_bytes.clear();
     const std::uint64_t previousOutboundSequence = m_lastOutboundSequence;
     if (!EnsureOutputSequence(emitter))
     {
@@ -330,18 +336,26 @@ AudioWorkerPollResult AudioWorkerSession::Poll(IAudioWorkerMessageEmitter& emitt
         }
         const std::size_t requestedBytes = requestedFrames * c_bytesPerFrame;
 
-        audio_ipc::Message response;
-        response.m_header.m_type = audio_ipc::MessageType::Pcm;
-        response.m_header.m_epoch = m_activeEpoch;
-        response.m_payload.resize(requestedBytes);
-        const std::size_t framesRead = m_worker.ReadFrames(response.m_payload.data(), requestedFrames, requestedBytes);
+        const std::uint64_t sequence = m_lastOutboundSequence + 1U;
+        audio_ipc::Error codecError = audio_ipc::Error::None;
+        if (!audio_ipc::PreparePcmMessage(m_activeEpoch, sequence, requestedBytes, m_pcmOutput, codecError))
+        {
+            m_pcmOutput.m_bytes.clear();
+            (void)Fail(AudioWorkerFaultCode::InternalFailure, emitter);
+            return m_state == AudioWorkerSessionState::Disconnected ? AudioWorkerPollResult::Terminal : AudioWorkerPollResult::FaultEmitted;
+        }
+
+        const std::size_t framesRead = m_worker.ReadFrames(
+            m_pcmOutput.m_bytes.data() + audio_ipc::c_headerBytes, requestedFrames, requestedBytes);
         if (framesRead > requestedFrames)
         {
+            m_pcmOutput.m_bytes.clear();
             (void)Fail(AudioWorkerFaultCode::InvalidCapturePacket, emitter);
             return m_state == AudioWorkerSessionState::Disconnected ? AudioWorkerPollResult::Terminal : AudioWorkerPollResult::FaultEmitted;
         }
         if (framesRead == 0U)
         {
+            m_pcmOutput.m_bytes.clear();
             snapshot = m_worker.Snapshot();
             if (snapshot.m_state != WorkerState::Running || snapshot.m_overflowEvents != 0U || snapshot.m_discontinuities != 0U ||
                 snapshot.m_invalidReads != 0U)
@@ -352,23 +366,35 @@ AudioWorkerPollResult AudioWorkerSession::Poll(IAudioWorkerMessageEmitter& emitt
             return AudioWorkerPollResult::NoData;
         }
 
-        response.m_payload.resize(framesRead * c_bytesPerFrame);
+        const std::size_t actualPayloadBytes = framesRead * c_bytesPerFrame;
         snapshot = m_worker.Snapshot();
         if (snapshot.m_state != WorkerState::Running || snapshot.m_overflowEvents != 0U || snapshot.m_discontinuities != 0U ||
             snapshot.m_invalidReads != 0U)
         {
+            m_pcmOutput.m_bytes.clear();
             (void)Fail(WorkerFaultFromSnapshot(snapshot), emitter);
             return m_state == AudioWorkerSessionState::Disconnected ? AudioWorkerPollResult::Terminal : AudioWorkerPollResult::FaultEmitted;
         }
 
-        if (!EmitMessage(response, emitter))
+        if (!audio_ipc::PreparePcmMessage(m_activeEpoch, sequence, actualPayloadBytes, m_pcmOutput, codecError))
         {
+            m_pcmOutput.m_bytes.clear();
+            (void)Fail(AudioWorkerFaultCode::InternalFailure, emitter);
+            return m_state == AudioWorkerSessionState::Disconnected ? AudioWorkerPollResult::Terminal : AudioWorkerPollResult::FaultEmitted;
+        }
+
+        if (!emitter.EmitPrepared(m_pcmOutput))
+        {
+            m_pcmOutput.m_bytes.clear();
+            OnTransportDisconnected();
             return AudioWorkerPollResult::Terminal;
         }
+        m_lastOutboundSequence = sequence;
         return AudioWorkerPollResult::PcmEmitted;
     }
     catch (...)
     {
+        m_pcmOutput.m_bytes.clear();
         (void)Fail(AudioWorkerFaultCode::InternalFailure, emitter);
         return m_state == AudioWorkerSessionState::Disconnected ? AudioWorkerPollResult::Terminal : AudioWorkerPollResult::FaultEmitted;
     }

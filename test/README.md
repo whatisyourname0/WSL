@@ -157,6 +157,42 @@ See the parts above for how to run your new test, but if nothing went awry, your
 
 To run all existing tests: `TE.exe wsltests.dll`
 
+### VirtioSoundUnitTests
+
+When built with `WSL_ENABLE_EXPERIMENTAL_VIRTIO_SOUND=ON` and
+`WSL_VIRTIO_SOUND_BUILD_TESTS=ON`, `wsltests.dll` includes
+`VirtioSoundUnitTests`. Each TAEF method executes one of the 21 offline
+regression suites and reports a missing executable, nonzero exit, or timeout
+as a test failure. The suite executables must remain beside the test DLL;
+the build and test-artifact pipeline arrange this automatically. Existing
+assertions and fake-device isolation are shared with the CTest developer loop.
+TAEF reports one result per suite. For the suite's detailed assertion output,
+run it directly or use `ctest --output-on-failure` in the corresponding build.
+
+In an environment already prepared for the repository integration tests, use:
+
+```bat
+bin\x64\Release\test.bat /name:*VirtioSoundUnitTests* -f
+```
+
+The normal `test.bat` setup and `wsltests.dll` module setup have machine/WSL
+side effects even when selecting an offline test. For an offline run that
+does not deploy WSL or configure a test distribution, invoke the separate
+adapter with the matching repository TAEF package instead:
+
+```bat
+packages\Microsoft.Taef.<version>\build\Binaries\x64\TE.exe bin\x64\Release\wsl_virtio_sound_taef_tests.dll /name:*VirtioSoundUnitTests* /sessionTimeout:0:05:00
+```
+
+The standalone subtree build can produce the same adapter with
+`WSL_VIRTIO_SOUND_BUILD_TESTS=ON`, `WSL_VIRTIO_SOUND_BUILD_TAEF_TESTS=ON`, and
+`WSL_VIRTIO_SOUND_TAEF_ROOT` pointing to the `Microsoft.Taef` package version
+in `packages.config`. Its DLL and suite executables are collected under
+`taef-tests/<configuration>`. Fork CI runs both CTest and this TAEF adapter.
+These tests use fake input; physical microphone validation remains explicitly
+opt-in. The independent Python probe's mock tests use standard-library
+`unittest` as documented in `tools/test/virtio-sound-alsa-probe/README.md`.
+
 ### SimpleTests
 
 Very basic tests focusing on the connection to WSL. Tests examine commands like `wsl echo`, `wsl --user`, and `wsl --cd`.

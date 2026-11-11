@@ -2,6 +2,7 @@
 
 #include "precomp.h"
 #include "AudioWorkerSession.hpp"
+#include "../src/BoundedPipeEmitter.hpp"
 
 #if defined(_WIN32)
 #include "../src/windows/ServerIdentityValidation.hpp"
@@ -190,9 +191,115 @@ Message MakeStart(std::uint64_t sequence, std::uint64_t epoch)
     return MakeControl(MessageType::Start, sequence, epoch, std::move(payload));
 }
 
+Message DecodeFront(const BoundedPipeEmitter& emitter)
+{
+    Require(!emitter.Empty(), "test emitter should have a queued frame");
+    Message message;
+    Error error = Error::None;
+    Require(
+        DecodeMessage(emitter.Front().m_bytes.data(), emitter.Front().m_bytes.size(), message, error),
+        "queued wire frame should decode");
+    return message;
+}
+
+void PrepareTestPcm(std::uint64_t sequence, std::size_t payloadBytes, std::uint8_t firstByte, OwnedWireMessage& frame)
+{
+    Error error = Error::None;
+    Require(PreparePcmMessage(1U, sequence, payloadBytes, frame, error), "test PCM frame should prepare");
+    for (std::size_t index = 0U; index < payloadBytes; ++index)
+    {
+        frame.m_bytes[c_headerBytes + index] = static_cast<std::uint8_t>(firstByte + index);
+    }
+}
+
 std::unique_ptr<ICaptureDeviceFactory> MakeFactory(const std::shared_ptr<FakeCaptureControl>& control)
 {
     return std::make_unique<FakeCaptureDeviceFactory>(control);
+}
+
+void TestBoundedPipeEmitterFifoAndLimit()
+{
+    BoundedPipeEmitter emitter;
+    const Message ready = MakeControl(MessageType::Ready, 1U);
+    const Message started = MakeControl(MessageType::Started, 2U, 1U);
+    const Message stopped = MakeControl(MessageType::Stopped, 3U, 1U);
+
+    Require(emitter.Emit(ready) && emitter.Emit(started), "emitter should accept two bounded messages");
+    Require(emitter.Size() == BoundedPipeEmitter::c_maximumQueuedMessages, "emitter should reach but not exceed its queue bound");
+    Require(!emitter.Emit(stopped), "emitter should reject a third message while full");
+    Require(
+        DecodeFront(emitter).m_header.m_type == MessageType::Ready,
+        "the first message should remain at the FIFO head when the queue is full");
+
+    OwnedWireMessage writerBuffer;
+    writerBuffer.m_bytes.swap(emitter.Front().m_bytes);
+    emitter.PopFront();
+    Require(emitter.Size() == 1U && DecodeFront(emitter).m_header.m_type == MessageType::Started, "popping should expose the second FIFO message");
+    Require(emitter.Emit(stopped), "a popped slot should make room for another message");
+    Require(DecodeFront(emitter).m_header.m_type == MessageType::Started, "appending should preserve the existing FIFO head");
+
+    writerBuffer.m_bytes.swap(emitter.Front().m_bytes);
+    emitter.PopFront();
+    Require(DecodeFront(emitter).m_header.m_type == MessageType::Stopped, "the newly appended message should follow the second message");
+    writerBuffer.m_bytes.swap(emitter.Front().m_bytes);
+    emitter.PopFront();
+    Require(emitter.Empty(), "draining should leave the bounded emitter empty");
+}
+
+void TestBoundedPipeEmitterPreparedFrameReuseAndValidation()
+{
+    BoundedPipeEmitter emitter;
+    OwnedWireMessage writerBuffer;
+    writerBuffer.m_bytes.reserve(512U);
+    const std::uint8_t* const reusableAddress = writerBuffer.m_bytes.data();
+
+    OwnedWireMessage first;
+    PrepareTestPcm(1U, 8U, 10U, first);
+    const std::uint8_t* const firstAddress = first.m_bytes.data();
+    Require(emitter.EmitPrepared(first), "emitter should accept a valid prepared frame");
+    Require(
+        emitter.Front().m_bytes.data() == firstAddress,
+        "prepared-frame emission should transfer its owned wire buffer without copying");
+    const Message firstDecoded = DecodeFront(emitter);
+    Require(
+        firstDecoded.m_header.m_type == MessageType::Pcm && firstDecoded.m_header.m_sequence == 1U &&
+            firstDecoded.m_payload.size() == 8U && firstDecoded.m_payload[0] == 10U && firstDecoded.m_payload[7] == 17U,
+        "queued prepared PCM should preserve its header and exact payload bytes");
+
+    writerBuffer.m_bytes.swap(emitter.Front().m_bytes);
+    emitter.PopFront();
+
+    OwnedWireMessage second;
+    PrepareTestPcm(2U, 8U, 20U, second);
+    Require(emitter.EmitPrepared(second), "emitter should accept the next prepared frame");
+    writerBuffer.m_bytes.swap(emitter.Front().m_bytes);
+    emitter.PopFront();
+
+    OwnedWireMessage third;
+    PrepareTestPcm(3U, 8U, 30U, third);
+    Require(emitter.EmitPrepared(third), "emitter should accept a third prepared frame after draining prior frames");
+    Require(
+        third.m_bytes.empty() && third.m_bytes.data() == reusableAddress && third.m_bytes.capacity() >= 512U,
+        "a dequeued writer buffer should return to the producer for reuse");
+    const Message thirdDecoded = DecodeFront(emitter);
+    Require(
+        thirdDecoded.m_header.m_sequence == 3U && thirdDecoded.m_payload.size() == 8U && thirdDecoded.m_payload[0] == 30U,
+        "recycling the producer's spare should not change the queued PCM frame");
+
+    PrepareTestPcm(4U, 8U, 40U, third);
+    Require(
+        third.m_bytes.data() == reusableAddress && third.m_bytes.capacity() >= 512U,
+        "the returned wire allocation should prepare a later frame in place");
+
+    writerBuffer.m_bytes.swap(emitter.Front().m_bytes);
+    emitter.PopFront();
+    OwnedWireMessage malformed;
+    malformed.m_bytes.resize(c_headerBytes, 0U);
+    const std::uint8_t* const malformedAddress = malformed.m_bytes.data();
+    Require(!emitter.EmitPrepared(malformed), "emitter should reject a malformed prepared frame");
+    Require(
+        emitter.Empty() && malformed.m_bytes.size() == c_headerBytes && malformed.m_bytes.data() == malformedAddress,
+        "rejecting a malformed frame should leave both queue and caller ownership unchanged");
 }
 
 void PushPacket(const std::shared_ptr<FakeCaptureControl>& control, std::uint32_t frames, std::uint8_t firstByte, bool discontinuity = false)
@@ -237,6 +344,25 @@ bool WaitForConsumedPackets(const std::shared_ptr<FakeCaptureControl>& control, 
 }
 
 bool WaitForPoll(AudioWorkerSession& session, CollectingEmitter& emitter, AudioWorkerPollResult expected)
+{
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const AudioWorkerPollResult result = session.Poll(emitter);
+        if (result == expected)
+        {
+            return true;
+        }
+        if (result == AudioWorkerPollResult::Terminal || result == AudioWorkerPollResult::FaultEmitted)
+        {
+            return false;
+        }
+        std::this_thread::sleep_for(2ms);
+    }
+    return false;
+}
+
+bool WaitForPoll(AudioWorkerSession& session, BoundedPipeEmitter& emitter, AudioWorkerPollResult expected)
 {
     const auto deadline = std::chrono::steady_clock::now() + 1500ms;
     while (std::chrono::steady_clock::now() < deadline)
@@ -322,6 +448,73 @@ void TestLifecyclePcmAndShutdownOrdering()
             emitter.messages.back().m_header.m_sequence == 5U,
         "Shutdown should emit Closed after the worker is stopped");
     Require(session.Poll(emitter) == AudioWorkerPollResult::Terminal, "closed session must not emit later PCM");
+}
+
+void TestSessionWithBoundedPipeEmitterPreparedPcmAndFullFailure()
+{
+    auto control = std::make_shared<FakeCaptureControl>();
+    AudioWorkerSession session(MakeFactory(control), 32U);
+    BoundedPipeEmitter emitter;
+
+    Require(
+        session.HandleControl(MakeControl(MessageType::Hello, 1U), emitter) == AudioWorkerSessionState::Ready,
+        "Hello should succeed through the production bounded emitter");
+    Message ready = DecodeFront(emitter);
+    Require(ready.m_header.m_type == MessageType::Ready && ready.m_header.m_sequence == 1U, "Ready should be the first decoded outbound message");
+    emitter.PopFront();
+
+    Require(
+        session.HandleControl(MakeStart(2U, 1U), emitter) == AudioWorkerSessionState::Capturing,
+        "Start should succeed through the production bounded emitter");
+    Message started = DecodeFront(emitter);
+    Require(
+        started.m_header.m_type == MessageType::Started && started.m_header.m_epoch == 1U && started.m_header.m_sequence == 2U,
+        "Started should follow Ready with the active epoch and next output sequence");
+    emitter.PopFront();
+
+    PushPacket(control, 2U, 31U);
+    Require(WaitForConsumedPackets(control, 1), "fake worker should consume the prepared-PCM fixture");
+    Require(WaitForPoll(session, emitter, AudioWorkerPollResult::PcmEmitted), "session should emit prepared PCM into the bounded emitter");
+    Message pcm = DecodeFront(emitter);
+    Require(
+        pcm.m_header.m_type == MessageType::Pcm && pcm.m_header.m_epoch == 1U && pcm.m_header.m_sequence == 3U &&
+            pcm.m_payload.size() == 8U && pcm.m_payload[0] == 31U && pcm.m_payload[7] == 38U,
+        "prepared PCM should decode with the exact samples, active epoch, and next sequence");
+
+    OwnedWireMessage writerBuffer;
+    writerBuffer.m_bytes.swap(emitter.Front().m_bytes);
+    emitter.PopFront();
+    Require(
+        session.HandleControl(MakeControl(MessageType::Stop, 3U, 1U), emitter) == AudioWorkerSessionState::Ready,
+        "Stop should remain valid after prepared PCM emission");
+    Message stopped = DecodeFront(emitter);
+    Require(
+        stopped.m_header.m_type == MessageType::Stopped && stopped.m_header.m_epoch == 1U && stopped.m_header.m_sequence == 4U,
+        "Stopped should follow PCM with a contiguous outbound sequence");
+    Require(control->closeCalls.load() == 1, "Stop should close the active fake capture once");
+    emitter.PopFront();
+
+    auto fullControl = std::make_shared<FakeCaptureControl>();
+    AudioWorkerSession fullSession(MakeFactory(fullControl), 32U);
+    BoundedPipeEmitter fullEmitter;
+    (void)fullSession.HandleControl(MakeControl(MessageType::Hello, 1U), fullEmitter);
+    fullEmitter.PopFront();
+    (void)fullSession.HandleControl(MakeStart(2U, 1U), fullEmitter);
+    fullEmitter.PopFront();
+    Require(
+        fullEmitter.Emit(MakeControl(MessageType::Ready, 50U)) && fullEmitter.Emit(MakeControl(MessageType::Ready, 51U)),
+        "the test should fill the actual bounded emitter before capture output");
+
+    PushPacket(fullControl, 2U, 90U);
+    Require(WaitForConsumedPackets(fullControl, 1), "fake worker should consume a packet before the full-queue check");
+    Require(
+        WaitForPoll(fullSession, fullEmitter, AudioWorkerPollResult::Terminal) &&
+            fullSession.State() == AudioWorkerSessionState::Disconnected && fullControl->closeCalls.load() == 1,
+        "a full emitter should fail closed and stop active capture rather than dropping PCM");
+    Require(
+        fullEmitter.Size() == BoundedPipeEmitter::c_maximumQueuedMessages &&
+            DecodeFront(fullEmitter).m_header.m_sequence == 50U,
+        "full-queue failure should leave accepted messages intact and must not enqueue PCM");
 }
 
 void TestRestartNeedsNewEpochAndDropsOldQueuedPcm()
@@ -832,6 +1025,9 @@ int main()
 {
     try
     {
+        TestBoundedPipeEmitterFifoAndLimit();
+        TestBoundedPipeEmitterPreparedFrameReuseAndValidation();
+        TestSessionWithBoundedPipeEmitterPreparedPcmAndFullFailure();
         TestConstructionAndHelloAreInert();
         TestLifecyclePcmAndShutdownOrdering();
         TestRestartNeedsNewEpochAndDropsOldQueuedPcm();

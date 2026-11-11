@@ -74,10 +74,30 @@ struct Message
     std::vector<std::uint8_t> m_payload;
 };
 
+// An already-framed message whose vector owns both the 32-byte wire header
+// and payload in one allocation. PCM producers can reserve the maximum frame,
+// write samples directly after the header, then finalize the actual byte count
+// with PreparePcmMessage without moving those samples.
+struct OwnedWireMessage
+{
+    std::vector<std::uint8_t> m_bytes;
+};
+
 // Decode and validate only the first 32 bytes. `size` may exceed the header
 // length so streaming callers can inspect a header before receiving payload.
 // The function never allocates and leaves `out` unchanged on failure.
 bool DecodeHeader(const std::uint8_t* data, std::size_t size, Header& out, Error& error) noexcept;
+
+// Validate one exact contiguous wire message without allocating or copying.
+bool ValidateWireMessage(const std::uint8_t* data, std::size_t size, Error& error) noexcept;
+
+// Resize an owned PCM wire frame and serialize its header in place. Existing
+// bytes after the 32-byte prefix are preserved when the size stays the same or
+// shrinks, so callers can finalize the frame count after writing PCM directly
+// into m_bytes.data() + c_headerBytes. payloadBytes must be nonzero and a
+// multiple of one stereo S16 frame (4 bytes). Existing storage is reused when
+// its capacity is sufficient.
+bool PreparePcmMessage(std::uint64_t epoch, std::uint64_t sequence, std::size_t payloadBytes, OwnedWireMessage& out, Error& error) noexcept;
 
 // Validate an already-owned message without allocating or copying its payload.
 // The header's declared payloadBytes must equal payload.size().
@@ -87,8 +107,9 @@ bool ValidateMessage(const Message& message, Error& error) noexcept;
 // truncated and trailing bytes are rejected. `out` is unchanged on failure.
 bool DecodeMessage(const std::uint8_t* data, std::size_t size, Message& out, Error& error);
 
-// Encode one validated message to its exact wire representation. `out` is
-// unchanged on failure.
+// Encode one validated message to its exact wire representation. Existing
+// capacity in `out` is reused. `out` is unchanged on validation or allocation
+// failure.
 bool EncodeMessage(const Message& message, std::vector<std::uint8_t>& out, Error& error);
 
 // Build or parse Start's fixed-format payload. Endpoint IDs use UTF-16 code

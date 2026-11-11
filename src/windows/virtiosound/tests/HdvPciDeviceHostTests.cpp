@@ -13,9 +13,12 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace wsl::virtio_sound::native::windows::testing {
@@ -27,6 +30,8 @@ void InstallHdvApiForTesting(
     decltype(&::HdvWriteGuestMemory) writeGuestMemory,
     decltype(&::HdvDeliverGuestInterrupt) deliverGuestInterrupt);
 void InstallGuestMemoryApertureApiForTesting(decltype(&::HdvCreateGuestMemoryAperture) createAperture, decltype(&::HdvDestroyGuestMemoryAperture) destroyAperture);
+void InstallDoorbellApiForTesting(decltype(&::HdvRegisterDoorbell) registerDoorbell, decltype(&::HdvUnregisterDoorbell) unregisterDoorbell);
+void FailNextHostWrapperAllocationForTesting() noexcept;
 void SetLifecycleTestHook(void (*hook)(void*, unsigned int) noexcept, void* context);
 using AperturePumpTestHook = void (*)(void* backendContext, void* hookContext) noexcept;
 using ApertureCopyTestHook = void (*)(void* hookContext, bool write) noexcept;
@@ -54,6 +59,7 @@ void ResetGuestMemoryApertureBatchStatsForTesting() noexcept;
 } // namespace wsl::virtio_sound::native::windows::testing
 
 namespace {
+using wsl::virtio_sound::native::PcmSource;
 using namespace wsl::virtio_sound::native::windows;
 
 constexpr unsigned int c_testHookCallbackAdmitted = 1;
@@ -79,6 +85,7 @@ struct FakeHdv final
 {
     std::mutex mutex;
     std::condition_variable apertureChanged;
+    std::condition_variable doorbellChanged;
     HCS_SYSTEM expectedSystem{};
     HDV_PCI_DEVICE_INTERFACE deviceInterface{};
     PVOID callbackContext{};
@@ -91,6 +98,8 @@ struct FakeHdv final
     HRESULT teardownResult{S_OK};
     HRESULT createApertureResult{S_OK};
     HRESULT destroyApertureResult{S_OK};
+    HRESULT registerDoorbellResult{S_OK};
+    HRESULT unregisterDoorbellResult{S_OK};
     bool returnNullDevice{};
     bool returnNullAperture{};
     bool returnApertureOnCreateFailure{};
@@ -103,8 +112,18 @@ struct FakeHdv final
     unsigned int writeGuestMemoryCalls{};
     unsigned int createApertureCalls{};
     unsigned int destroyApertureCalls{};
+    unsigned int registerDoorbellCalls{};
+    unsigned int unregisterDoorbellCalls{};
     bool createArgumentsValid{};
     bool initializeSystemValid{};
+    bool registerDoorbellArgumentsValid{};
+    bool unregisterDoorbellArgumentsValid{};
+    bool unregisterEventWasUsable{};
+    bool blockDoorbellRegistration{};
+    bool doorbellRegistrationEntered{};
+    bool releaseDoorbellRegistration{};
+    HANDLE registeredDoorbellEvent{};
+    std::vector<char> hostLifecycleOrder;
     std::array<BYTE, c_fakeGuestMemoryBytes> guestMemory{};
     std::vector<FakeGuestAperture> activeApertures;
     std::vector<FakeGuestAperture> apertureCreateLog;
@@ -159,6 +178,7 @@ HRESULT WINAPI FakeTeardown(HDV_HOST deviceHost)
 {
     std::lock_guard<std::mutex> lock(g_fake.mutex);
     ++g_fake.teardownCalls;
+    g_fake.hostLifecycleOrder.push_back('T');
     if (deviceHost != g_fake.lastHost)
     {
         return E_HANDLE;
@@ -317,6 +337,41 @@ HRESULT WINAPI FakeDeliverGuestInterrupt(HDV_DEVICE, UINT64, UINT32)
     return S_OK;
 }
 
+HRESULT WINAPI FakeRegisterDoorbell(
+    HDV_DEVICE requestor, HDV_PCI_BAR_SELECTOR barIndex, UINT64 barOffset, UINT64 triggerValue, UINT64 flags, HANDLE doorbellEvent)
+{
+    std::unique_lock<std::mutex> lock(g_fake.mutex);
+    ++g_fake.registerDoorbellCalls;
+    g_fake.hostLifecycleOrder.push_back('R');
+    g_fake.registerDoorbellArgumentsValid = requestor == g_fake.lastDevice && barIndex == HDV_PCI_BAR0 && barOffset == 0x30c &&
+                                             triggerValue == 3 && flags == HDV_DOORBELL_FLAG_TRIGGER_SIZE_WORD &&
+                                             (flags & HDV_DOORBELL_FLAG_TRIGGER_ANY_VALUE) == 0 && doorbellEvent != nullptr;
+    if (SUCCEEDED(g_fake.registerDoorbellResult))
+    {
+        g_fake.registeredDoorbellEvent = doorbellEvent;
+    }
+    g_fake.doorbellRegistrationEntered = true;
+    g_fake.doorbellChanged.notify_all();
+    g_fake.doorbellChanged.wait(lock, [] { return !g_fake.blockDoorbellRegistration || g_fake.releaseDoorbellRegistration; });
+    return g_fake.registerDoorbellResult;
+}
+
+HRESULT WINAPI FakeUnregisterDoorbell(HDV_DEVICE requestor, HDV_PCI_BAR_SELECTOR barIndex, UINT64 barOffset, UINT64 triggerValue, UINT64 flags)
+{
+    std::lock_guard<std::mutex> lock(g_fake.mutex);
+    ++g_fake.unregisterDoorbellCalls;
+    g_fake.hostLifecycleOrder.push_back('U');
+    g_fake.unregisterDoorbellArgumentsValid = requestor == g_fake.lastDevice && barIndex == HDV_PCI_BAR0 && barOffset == 0x30c &&
+                                               triggerValue == 3 && flags == HDV_DOORBELL_FLAG_TRIGGER_SIZE_WORD &&
+                                               (flags & HDV_DOORBELL_FLAG_TRIGGER_ANY_VALUE) == 0;
+    if (g_fake.registeredDoorbellEvent != nullptr)
+    {
+        g_fake.unregisterEventWasUsable = SetEvent(g_fake.registeredDoorbellEvent) != FALSE &&
+                                          WaitForSingleObject(g_fake.registeredDoorbellEvent, 0) == WAIT_OBJECT_0;
+    }
+    return g_fake.unregisterDoorbellResult;
+}
+
 void ResetFake(HRESULT createResult = S_OK, bool returnNullDevice = false, HRESULT teardownResult = S_OK)
 {
     std::lock_guard<std::mutex> lock(g_fake.mutex);
@@ -332,6 +387,8 @@ void ResetFake(HRESULT createResult = S_OK, bool returnNullDevice = false, HRESU
     g_fake.teardownResult = teardownResult;
     g_fake.createApertureResult = S_OK;
     g_fake.destroyApertureResult = S_OK;
+    g_fake.registerDoorbellResult = S_OK;
+    g_fake.unregisterDoorbellResult = S_OK;
     g_fake.returnNullDevice = returnNullDevice;
     g_fake.returnNullAperture = false;
     g_fake.returnApertureOnCreateFailure = false;
@@ -344,11 +401,28 @@ void ResetFake(HRESULT createResult = S_OK, bool returnNullDevice = false, HRESU
     g_fake.writeGuestMemoryCalls = 0;
     g_fake.createApertureCalls = 0;
     g_fake.destroyApertureCalls = 0;
+    g_fake.registerDoorbellCalls = 0;
+    g_fake.unregisterDoorbellCalls = 0;
     g_fake.createArgumentsValid = false;
     g_fake.initializeSystemValid = false;
+    g_fake.registerDoorbellArgumentsValid = false;
+    g_fake.unregisterDoorbellArgumentsValid = false;
+    g_fake.unregisterEventWasUsable = false;
+    g_fake.blockDoorbellRegistration = false;
+    g_fake.doorbellRegistrationEntered = false;
+    g_fake.releaseDoorbellRegistration = false;
+    g_fake.registeredDoorbellEvent = nullptr;
+    g_fake.hostLifecycleOrder.clear();
     g_fake.guestMemory.fill(0);
     g_fake.activeApertures.clear();
     g_fake.apertureCreateLog.clear();
+}
+
+void SetDoorbellTestApis(bool registerAvailable, bool unregisterAvailable)
+{
+    testing::InstallDoorbellApiForTesting(
+        registerAvailable ? &FakeRegisterDoorbell : nullptr,
+        unregisterAvailable ? &FakeUnregisterDoorbell : nullptr);
 }
 
 struct CallbackSnapshot final
@@ -567,7 +641,7 @@ void TestPumpBatchReusesAndCleansApertures()
     testing::SetAperturePumpTestHook(&ExerciseGuestMemoryDuringPump, &probe);
 
     (void)host->PumpCapture(1);
-    (void)host->PumpCaptureElapsed(10'000'000);
+    (void)host->ServiceCapture(10'000'000, false);
     testing::SetAperturePumpTestHook(nullptr, nullptr);
 
     const auto stats = testing::GetGuestMemoryApertureBatchStatsForTesting();
@@ -831,7 +905,7 @@ void TestConcurrentCopyCompletesBeforeBatchDestroy()
 
     int pumpResult = -1;
     bool concurrentCopyResult{};
-    std::thread pumpThread([&] { pumpResult = host->PumpCapture(1); });
+    std::thread pumpThread([&] { pumpResult = host->ServiceCapture(1, true).m_frames; });
     auto waitForProbe = [&](bool ApertureConcurrencyProbe::* flag) {
         std::unique_lock<std::mutex> lock(probe.mutex);
         return probe.changed.wait_for(lock, std::chrono::seconds(5), [&] { return probe.*flag; });
@@ -929,7 +1003,9 @@ void TestDestroyFailureRetainsMappingsAndPinsHost()
 void TestSuccessfulSharedHostRetiresPinned()
 {
     ResetFake();
-    auto host = HdvPciDeviceHost::CreateBorrowed(FakeSystem(), c_deviceClassId, c_deviceInstanceId, {}, HostOwnership::UnknownOrShared);
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    std::weak_ptr<CaptureWakeSignal> retainedWake = wake;
+    auto host = HdvPciDeviceHost::CreateBorrowed(FakeSystem(), c_deviceClassId, c_deviceInstanceId, {}, HostOwnership::UnknownOrShared, wake);
     Require(host->Ownership() == HostOwnership::UnknownOrShared, "shared host ownership was not preserved");
     const auto callbacks = GetCallbackSnapshot();
     Require(callbacks.context != nullptr, "fake HDV API did not receive callback context");
@@ -947,6 +1023,20 @@ void TestSuccessfulSharedHostRetiresPinned()
         "GetDetails returned the wrong PCI identity");
     Require(probedBars[0] == 0xffffe000U, "GetDetails returned the wrong BAR size");
     Require(callbacks.deviceInterface.Start(callbacks.context) == S_OK, "Start callback failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "Start wake reason differs");
+    const UINT16 queue = 3;
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, sizeof(queue), reinterpret_cast<const BYTE*>(&queue)) == S_OK,
+        "RX queue kick failed");
+    wake->Notify(CaptureWakeReason::SourceData);
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "coalesced kick did not wake the owner");
+    Require(
+        wake->Consume() == (static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue) |
+                            static_cast<std::uint32_t>(CaptureWakeReason::SourceData)),
+        "coalescing lost a source or guest wake reason");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_TIMEOUT, "consumed event remained signaled");
 
     Require(
         host->GuestStoppedAndRetire() == RetireOutcome::OwnershipUnprovenAndPinned,
@@ -957,12 +1047,459 @@ void TestSuccessfulSharedHostRetiresPinned()
     Require(
         callbacks.deviceInterface.Initialize(callbacks.context) == E_ABORT, "callback admission remained open after retirement");
     host.reset();
+    wake.reset();
+    Require(!retainedWake.expired(), "pinned callback state lost ownership of its wake event");
 
     std::lock_guard<std::mutex> lock(g_fake.mutex);
     Require(g_fake.initializeCalls == 1 && g_fake.createCalls == 1, "unexpected fake HDV create call count");
     Require(g_fake.initializeSystemValid, "borrowed HCS_SYSTEM identity changed before HDV initialization");
     Require(g_fake.createArgumentsValid, "HDV create received the wrong PCI class/instance/interface");
     Require(g_fake.teardownCalls == 0, "unknown/shared host called HdvTeardownDeviceHost");
+}
+
+class GateHoldingPcmSource final : public PcmSource
+{
+public:
+    bool ReadFrames(std::uint32_t, std::uint8_t*, std::size_t) noexcept override { return true; }
+    void Reset() noexcept override {}
+
+    // This fake intentionally blocks a state query so the test can hold the
+    // device gate while exercising the independent BAR callback path.
+    std::optional<std::uint32_t> AvailableFrames() const noexcept override
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_blockNext)
+        {
+            m_blockNext = false;
+            m_entered = true;
+            m_changed.notify_all();
+            m_changed.wait(lock, [this] { return m_release; });
+        }
+        return std::nullopt;
+    }
+
+    void BlockNextAvailability() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_blockNext = true;
+        m_entered = false;
+        m_release = false;
+    }
+
+    bool WaitUntilBlocked(std::chrono::milliseconds timeout) const
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_changed.wait_for(lock, timeout, [this] { return m_entered; });
+    }
+
+    void Release() const
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_release = true;
+        }
+        m_changed.notify_all();
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    mutable std::condition_variable m_changed;
+    mutable bool m_blockNext{};
+    mutable bool m_entered{};
+    mutable bool m_release{};
+};
+
+std::unique_ptr<HdvPciDeviceHost> CreateStartedHostWithSource(
+    std::shared_ptr<PcmSource> source, std::shared_ptr<CaptureWakeSignal> wake)
+{
+    auto host = HdvPciDeviceHost::CreateBorrowed(
+        FakeSystem(), c_deviceClassId, c_deviceInstanceId, std::move(source), HostOwnership::VerifiedExclusive, std::move(wake));
+    const auto callbacks = GetCallbackSnapshot();
+    Require(callbacks.deviceInterface.Start(callbacks.context) == S_OK, "fake HDV Start callback failed");
+    return host;
+}
+
+void TestRxKickFastPathAndLegacyValidation()
+{
+    ResetFake();
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource({}, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the RX validation owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "Start used the wrong validation wake reason");
+
+    const std::array<BYTE, 2> validRxKick{3, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "valid RX queue kick failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "valid RX queue kick did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "valid RX kick used the wrong wake reason");
+    auto snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 0 && snapshot.m_notificationFailures == 0,
+        "valid RX fast-path kick changed the core notification counters");
+
+    const std::array<BYTE, 2> wrongQueueValue{2, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, wrongQueueValue.size(), wrongQueueValue.data()) == S_OK,
+        "mismatched RX queue kick changed the callback HRESULT");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "legacy mismatched kick did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "legacy RX kick used the wrong wake reason");
+    snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 1 && snapshot.m_notificationFailures == 1,
+        "mismatched RX kick did not retain core validation and accounting");
+
+    const std::array<BYTE, 4> wrongWidthValue{3, 0, 0, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, wrongWidthValue.size(), wrongWidthValue.data()) == S_OK,
+        "wrong-width RX write changed the callback HRESULT");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "legacy wrong-width write did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "wrong-width RX write used the wrong wake reason");
+    snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 1 && snapshot.m_notificationFailures == 1,
+        "wrong-width RX write was misclassified as a core queue notification");
+
+    const std::array<BYTE, 2> validTxQueueKick{2, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x308, validTxQueueKick.size(), validTxQueueKick.data()) == S_OK,
+        "non-RX queue kick failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "legacy non-RX queue kick did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "non-RX queue kick changed its legacy wake reason");
+    snapshot = host->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 2 && snapshot.m_notificationFailures == 1,
+        "non-RX queue kick did not retain core notification accounting");
+    Require(
+        host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "fast-path validation host did not retire cleanly");
+
+    ResetFake();
+    auto noWakeHost = CreateStartedHostWithSource({}, {});
+    const auto noWakeCallbacks = GetCallbackSnapshot();
+    Require(
+        noWakeCallbacks.deviceInterface.WriteInterceptedMemory(
+            noWakeCallbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "valid RX kick without a wake signal failed");
+    snapshot = noWakeHost->Device().GetDiagnosticsSnapshot();
+    Require(
+        snapshot.m_notificationRequests == 1 && snapshot.m_notificationFailures == 0,
+        "valid RX kick without a wake signal bypassed the core notification path");
+    Require(
+        noWakeHost->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "no-wake RX host did not retire cleanly");
+}
+
+void TestRxKickCompletesWhileServiceCaptureHoldsDeviceGate()
+{
+    ResetFake();
+    auto source = std::make_shared<GateHoldingPcmSource>();
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource(source, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the gate-held test owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestState), "Start used the wrong gate-test wake reason");
+
+    source->BlockNextAvailability();
+    std::thread serviceThread([&] { (void)host->ServiceCapture(1'000'000, true); });
+    const bool serviceHoldsGate = source->WaitUntilBlocked(std::chrono::seconds(5));
+
+    std::mutex callbackMutex;
+    std::condition_variable callbackChanged;
+    bool callbackCompleted{};
+    HRESULT callbackResult{E_PENDING};
+    std::thread callbackThread;
+    if (serviceHoldsGate)
+    {
+        callbackThread = std::thread([&] {
+            const std::array<BYTE, 2> validRxKick{3, 0};
+            const HRESULT result = callbacks.deviceInterface.WriteInterceptedMemory(
+                callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data());
+            {
+                std::lock_guard<std::mutex> lock(callbackMutex);
+                callbackResult = result;
+                callbackCompleted = true;
+            }
+            callbackChanged.notify_all();
+        });
+    }
+
+    bool completedBeforeServiceRelease{};
+    if (serviceHoldsGate)
+    {
+        std::unique_lock<std::mutex> lock(callbackMutex);
+        completedBeforeServiceRelease = callbackChanged.wait_for(lock, std::chrono::seconds(5), [&] { return callbackCompleted; });
+    }
+    source->Release();
+    serviceThread.join();
+    if (callbackThread.joinable())
+    {
+        callbackThread.join();
+    }
+
+    Require(serviceHoldsGate, "ServiceCapture did not reach the gate-held source query");
+    Require(completedBeforeServiceRelease, "valid RX callback waited for ServiceCapture to release the device gate");
+    Require(callbackResult == S_OK, "valid RX callback failed while ServiceCapture held the gate");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "gate-independent RX callback did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "gate-independent RX callback used the wrong wake reason");
+    Require(
+        host->Device().GetDiagnosticsSnapshot().m_notificationRequests == 0,
+        "gate-independent RX callback entered the core notification path");
+    Require(
+        host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "gate-held callback test host did not retire cleanly");
+}
+
+void TestOptionalDoorbellFallbackAndRegistrationFailure()
+{
+    const std::array<BYTE, 2> validRxKick{3, 0};
+
+    ResetFake();
+    SetDoorbellTestApis(true, false);
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource({}, wake);
+    Require(!host->RxDoorbellRegistered(), "doorbell registered without its unregister export");
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the deferred-registration owner");
+    (void)wake->Consume();
+    (void)host->ServiceCapture(1'000'000, false);
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "legacy RX callback failed when the optional export pair was incomplete");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 0, "RX callback called the doorbell API reentrantly");
+    }
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "legacy RX callback did not signal the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "legacy RX callback used the wrong wake reason");
+    (void)host->ServiceCapture(1'000'000, false);
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 0 && g_fake.unregisterDoorbellCalls == 0, "incomplete API pair was invoked");
+    }
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "RX callback stopped working after missing optional exports");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "missing exports disabled the callback wake fallback");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "missing-export fallback used the wrong wake reason");
+    (void)host->ServiceCapture(1'000'000, false);
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 0 && g_fake.unregisterDoorbellCalls == 0, "missing exports were retried");
+    }
+    Require(SUCCEEDED(host->PrepareForGuestStop()), "disabled doorbell did not prepare for guest stop");
+    Require(host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded, "fallback host did not retire normally");
+    host.reset();
+    wake.reset();
+    SetDoorbellTestApis(false, false);
+
+    ResetFake();
+    SetDoorbellTestApis(true, true);
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        g_fake.registerDoorbellResult = E_FAIL;
+    }
+    auto failedWake = std::make_shared<CaptureWakeSignal>();
+    auto failedHost = CreateStartedHostWithSource({}, failedWake);
+    Require(!failedHost->RxDoorbellRegistered(), "failed registration remained active");
+    const auto failedCallbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(failedWake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the failed-registration owner");
+    (void)failedWake->Consume();
+    Require(
+        failedCallbacks.deviceInterface.WriteInterceptedMemory(
+            failedCallbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "legacy RX callback failed after registration error");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 0, "doorbell registration ran before host servicing");
+    }
+    Require(WaitForSingleObject(failedWake->Event(), 0) == WAIT_OBJECT_0, "registration failure did not fall back to the callback wake");
+    Require(failedWake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "registration fallback used the wrong wake reason");
+    (void)failedHost->ServiceCapture(1'000'000, false);
+    Require(!failedHost->RxDoorbellRegistered(), "failed registration remained active");
+    // The failed one-shot attempt must not repeat; the callback remains the fallback.
+    Require(
+        failedCallbacks.deviceInterface.WriteInterceptedMemory(
+            failedCallbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "RX callback stopped working after registration error");
+    Require(WaitForSingleObject(failedWake->Event(), 0) == WAIT_OBJECT_0, "failed registration did not preserve callback fallback");
+    Require(failedWake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "post-failure RX wake reason differed");
+    (void)failedHost->ServiceCapture(1'000'000, false);
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 1 && g_fake.registerDoorbellArgumentsValid, "failed registration used the wrong tuple");
+        Require(g_fake.unregisterDoorbellCalls == 0, "failed registration attempted unregister");
+    }
+    Require(SUCCEEDED(failedHost->PrepareForGuestStop()), "failed-registration state did not prepare for guest stop");
+    Require(failedHost->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded, "registration-fallback host did not retire normally");
+    failedHost.reset();
+    failedWake.reset();
+    SetDoorbellTestApis(false, false);
+}
+
+void TestExactDoorbellAndUnregisterBeforeTeardown()
+{
+    ResetFake();
+    SetDoorbellTestApis(true, true);
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource({}, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the exact-doorbell owner");
+    (void)wake->Consume();
+    (void)host->ServiceCapture(1'000'000, false);
+    Require(!host->RxDoorbellRegistered(), "doorbell registered before a valid guest RX write");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 0, "doorbell API was called before a valid RX callback");
+    }
+    const std::array<BYTE, 2> validRxQueue{3, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, validRxQueue.size(), validRxQueue.data()) == S_OK,
+        "first valid RX kick failed");
+    Require(!host->RxDoorbellRegistered(), "doorbell registered inside the HDV write callback");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "first valid RX kick did not wake the owner");
+    Require(wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue), "first valid RX kick used the wrong reason");
+    (void)host->ServiceCapture(1'000'000, false);
+    Require(host->RxDoorbellRegistered(), "successful exact RX doorbell did not become active");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 1 && g_fake.registerDoorbellArgumentsValid, "register did not use BAR0/0x30c/WORD/value 3");
+        Require(g_fake.registeredDoorbellEvent == wake->Event(), "registration did not use the owner's auto-reset event");
+    }
+    Require(SetEvent(wake->Event()) != FALSE, "fake doorbell could not signal the owner event");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "fake doorbell event was not observable");
+    Require(wake->Consume() == 0, "doorbell event fabricated a callback wake reason");
+
+    // A value that does not match queue 3 must still go through the installed
+    // callback and the core's legacy queue validation.
+    const std::array<BYTE, 2> wrongRxQueue{2, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, wrongRxQueue.size(), wrongRxQueue.data()) == S_OK,
+        "wrong-value RX write stopped reaching legacy validation");
+    Require(host->Device().GetDiagnosticsSnapshot().m_notificationFailures == 1, "wrong RX value bypassed core validation");
+
+    Require(SUCCEEDED(host->PrepareForGuestStop()), "registered doorbell did not unregister before VM shutdown");
+    Require(!host->RxDoorbellRegistered(), "pre-stop unregister left the doorbell active");
+    Require(host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded, "registered doorbell host did not retire");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.unregisterDoorbellCalls == 1 && g_fake.unregisterDoorbellArgumentsValid, "unregister did not match the registered tuple");
+        Require(g_fake.unregisterEventWasUsable, "wake event was not alive until unregister returned");
+        Require(g_fake.hostLifecycleOrder == std::vector<char>{'R', 'U', 'T'}, "unregister did not precede host teardown");
+    }
+    host.reset();
+    wake.reset();
+    SetDoorbellTestApis(false, false);
+}
+
+void TestDoorbellUnregisterFailurePinsAndSkipsTeardown()
+{
+    ResetFake();
+    SetDoorbellTestApis(true, true);
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        g_fake.unregisterDoorbellResult = E_FAIL;
+    }
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    std::weak_ptr<CaptureWakeSignal> retainedWake = wake;
+    auto host = CreateStartedHostWithSource({}, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the unregister-failure owner");
+    (void)wake->Consume();
+    const std::array<BYTE, 2> validRxKick{3, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "unregister-failure setup RX kick failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "unregister-failure setup kick did not wake the owner");
+    (void)wake->Consume();
+    (void)host->ServiceCapture(1'000'000, false);
+    Require(host->RxDoorbellRegistered(), "unregister-failure setup did not register");
+    Require(FAILED(host->PrepareForGuestStop()), "uncertain pre-stop unregister was reported as successful");
+    Require(
+        host->GuestStoppedAndRetire() == RetireOutcome::TeardownFailedAndPinned,
+        "uncertain doorbell unregister did not fail closed after VM exit");
+    host.reset();
+    wake.reset();
+    Require(!retainedWake.expired(), "uncertain unregister allowed the event to close");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.unregisterDoorbellCalls == 1, "uncertain unregister was retried");
+        Require(g_fake.teardownCalls == 0, "host teardown ran after uncertain unregister");
+        Require(g_fake.hostLifecycleOrder == std::vector<char>{'R', 'U'}, "an operation followed uncertain unregister");
+    }
+    SetDoorbellTestApis(false, false);
+}
+
+void TestUnattemptedPreparationLeavesCallbackFallbackLive()
+{
+    ResetFake();
+    SetDoorbellTestApis(true, true);
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    auto host = CreateStartedHostWithSource({}, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the pre-stop fallback owner");
+    (void)wake->Consume();
+
+    Require(SUCCEEDED(host->PrepareForGuestStop()), "unattempted adapter did not prepare for guest stop");
+    const std::array<BYTE, 2> validRxKick{3, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "normal RX callback was disabled by doorbell preparation");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "prepared host did not preserve the callback wake fallback");
+    Require(
+        wake->Consume() == static_cast<std::uint32_t>(CaptureWakeReason::GuestQueue),
+        "prepared callback used the wrong wake reason");
+    (void)host->ServiceCapture(1'000'000, false);
+    Require(!host->RxDoorbellRegistered(), "prepared host registered a doorbell after an RX kick");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(
+            g_fake.registerDoorbellCalls == 0 && g_fake.unregisterDoorbellCalls == 0,
+            "unattempted preparation called a doorbell API");
+    }
+    Require(
+        host->GuestStoppedAndRetire() == RetireOutcome::TeardownSucceeded,
+        "prepared, inactive doorbell host did not retire cleanly");
+    SetDoorbellTestApis(false, false);
+}
+
+void TestAllocationFailureDoesNotAttemptEarlyDoorbellRegistration()
+{
+    ResetFake();
+    SetDoorbellTestApis(true, true);
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    std::weak_ptr<CaptureWakeSignal> retainedWake = wake;
+    testing::FailNextHostWrapperAllocationForTesting();
+    bool allocationFailed{};
+    try
+    {
+        auto host = HdvPciDeviceHost::CreateBorrowed(FakeSystem(), c_deviceClassId, c_deviceInstanceId, {}, HostOwnership::VerifiedExclusive, wake);
+        (void)host;
+    }
+    catch (const std::bad_alloc&)
+    {
+        allocationFailed = true;
+    }
+    Require(allocationFailed, "host wrapper allocation fault was not injected");
+    wake.reset();
+    Require(!retainedWake.expired(), "failed creation released the pinned callback state");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(g_fake.registerDoorbellCalls == 0 && g_fake.unregisterDoorbellCalls == 0, "allocation failure attempted doorbell registration");
+        Require(g_fake.teardownCalls == 0, "allocation failure attempted unproven host teardown");
+        Require(g_fake.hostLifecycleOrder.empty(), "allocation failure attempted doorbell cleanup");
+    }
+    SetDoorbellTestApis(false, false);
 }
 
 void TestFailedCreateClosesAdmissionForLateCallbacks()
@@ -1099,6 +1636,105 @@ void TestRetirementDrainsActiveCallback()
     Require(retireResult == RetireOutcome::OwnershipUnprovenAndPinned, "shared retirement returned the wrong outcome");
 }
 
+void TestPostExitRetirementSkipsUnpreparedDoorbellUnregister()
+{
+    ResetFake();
+    SetDoorbellTestApis(true, true);
+    auto source = std::make_shared<GateHoldingPcmSource>();
+    auto wake = std::make_shared<CaptureWakeSignal>();
+    std::weak_ptr<CaptureWakeSignal> retainedWake = wake;
+    auto host = CreateStartedHostWithSource(source, wake);
+    const auto callbacks = GetCallbackSnapshot();
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "Start did not wake the registration-drain owner");
+    (void)wake->Consume();
+
+    const std::array<BYTE, 2> validRxKick{3, 0};
+    Require(
+        callbacks.deviceInterface.WriteInterceptedMemory(
+            callbacks.context, HDV_PCI_BAR0, 0x30c, validRxKick.size(), validRxKick.data()) == S_OK,
+        "registration-drain RX kick failed");
+    Require(WaitForSingleObject(wake->Event(), 0) == WAIT_OBJECT_0, "registration-drain RX kick did not wake the owner");
+    (void)wake->Consume();
+
+    source->BlockNextAvailability();
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        g_fake.blockDoorbellRegistration = true;
+    }
+    DrainProbe probe;
+    testing::SetLifecycleTestHook(&DrainLifecycleHook, &probe);
+    RetireOutcome retireResult{RetireOutcome::AlreadyRetired};
+    std::atomic<bool> serviceReturned{};
+    std::atomic<bool> retireReturned{};
+    std::thread serviceThread([&] {
+        (void)host->ServiceCapture(1'000'000, true);
+        serviceReturned.store(true, std::memory_order_release);
+    });
+
+    bool registrationEntered{};
+    {
+        std::unique_lock<std::mutex> lock(g_fake.mutex);
+        registrationEntered = g_fake.doorbellChanged.wait_for(lock, std::chrono::seconds(5), [] {
+            return g_fake.doorbellRegistrationEntered;
+        });
+    }
+    if (!registrationEntered)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_fake.mutex);
+            g_fake.releaseDoorbellRegistration = true;
+        }
+        g_fake.doorbellChanged.notify_all();
+        source->Release();
+        serviceThread.join();
+        testing::SetLifecycleTestHook(nullptr, nullptr);
+        (void)host->GuestStoppedAndRetire();
+        Require(false, "doorbell registration was not reached from ServiceCapture");
+    }
+
+    std::thread retireThread([&] {
+        retireResult = host->GuestStoppedAndRetire();
+        retireReturned.store(true, std::memory_order_release);
+    });
+    bool retirementDisarmed{};
+    {
+        std::unique_lock<std::mutex> lock(probe.mutex);
+        retirementDisarmed = probe.changed.wait_for(lock, std::chrono::seconds(5), [&] { return probe.retireDisarmed; });
+    }
+    const bool retiredBeforeRegistrationReturned = retireReturned.load(std::memory_order_acquire);
+
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        g_fake.releaseDoorbellRegistration = true;
+    }
+    g_fake.doorbellChanged.notify_all();
+    const bool serviceReachedCoreGate = source->WaitUntilBlocked(std::chrono::seconds(5));
+    const bool retiredWhileServiceWasActive = retireReturned.load(std::memory_order_acquire);
+    source->Release();
+    serviceThread.join();
+    retireThread.join();
+    testing::SetLifecycleTestHook(nullptr, nullptr);
+
+    Require(retirementDisarmed, "retirement did not close callback admission during registration");
+    Require(!retiredBeforeRegistrationReturned, "retirement returned while HDV registration was active");
+    Require(serviceReachedCoreGate, "registration did not finish before ServiceCapture entered the device gate");
+    Require(!retiredWhileServiceWasActive, "retirement returned while the pinned ServiceCapture operation was active");
+    Require(serviceReturned.load(std::memory_order_acquire), "ServiceCapture did not finish after the gate was released");
+    Require(retireResult == RetireOutcome::TeardownFailedAndPinned, "unprepared registration did not fail closed after VM exit");
+    {
+        std::lock_guard<std::mutex> lock(g_fake.mutex);
+        Require(
+            g_fake.registerDoorbellCalls == 1 && g_fake.unregisterDoorbellCalls == 0,
+            "post-exit retirement attempted HDV unregister");
+        Require(g_fake.teardownCalls == 0, "host teardown ran with an active doorbell");
+        Require(g_fake.hostLifecycleOrder == std::vector<char>{'R'}, "operation followed missing pre-stop unregister");
+    }
+    host.reset();
+    wake.reset();
+    Require(!retainedWake.expired(), "missing pre-stop unregister did not retain the event");
+    SetDoorbellTestApis(false, false);
+}
+
 void TestExclusiveTeardownFailureIsNotRetried()
 {
     ResetFake(S_OK, false, E_FAIL);
@@ -1143,12 +1779,28 @@ int main()
         std::cout << "PASS: batch cleanup waits for concurrent mapped copies\n";
         TestSuccessfulSharedHostRetiresPinned();
         std::cout << "PASS: shared-host successful create, callback table, pinning, and repeated retirement\n";
+        TestRxKickFastPathAndLegacyValidation();
+        std::cout << "PASS: exact RX kick fast path, legacy validation, wake behavior, and core counters\n";
+        TestRxKickCompletesWhileServiceCaptureHoldsDeviceGate();
+        std::cout << "PASS: RX kick callback completes while ServiceCapture holds the device gate\n";
+        TestOptionalDoorbellFallbackAndRegistrationFailure();
+        std::cout << "PASS: optional doorbell export gating and callback fallback\n";
+        TestExactDoorbellAndUnregisterBeforeTeardown();
+        std::cout << "PASS: exact RX doorbell tuple and unregister ordering\n";
+        TestDoorbellUnregisterFailurePinsAndSkipsTeardown();
+        std::cout << "PASS: uncertain doorbell unregister keeps the event pinned\n";
+        TestUnattemptedPreparationLeavesCallbackFallbackLive();
+        std::cout << "PASS: pre-stop closes registration admission while preserving RX callback fallback\n";
+        TestAllocationFailureDoesNotAttemptEarlyDoorbellRegistration();
+        std::cout << "PASS: wrapper allocation failure precedes doorbell registration\n";
         TestFailedCreateClosesAdmissionForLateCallbacks();
         std::cout << "PASS: failed device creation rejects late callbacks\n";
         TestNullCreateClosesAdmissionForLateCallbacks();
         std::cout << "PASS: null device creation rejects late callbacks\n";
         TestRetirementDrainsActiveCallback();
         std::cout << "PASS: retirement drains an admitted callback and rejects a later callback\n";
+        TestPostExitRetirementSkipsUnpreparedDoorbellUnregister();
+        std::cout << "PASS: post-exit retirement skips unprepared doorbell unregister and pins safely\n";
         TestExclusiveTeardownFailureIsNotRetried();
         std::cout << "PASS: failed exclusive teardown remains pinned and is not retried\n";
         TestDestroyFailureRetainsMappingsAndPinsHost();

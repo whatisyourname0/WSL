@@ -359,6 +359,70 @@ bool DecodeHeader(const std::uint8_t* data, std::size_t size, Header& out, Error
     return true;
 }
 
+bool ValidateWireMessage(const std::uint8_t* data, std::size_t size, Error& error) noexcept
+{
+    Header header{};
+    if (!DecodeHeader(data, size, header, error))
+    {
+        return false;
+    }
+
+    const std::size_t expectedSize = c_headerBytes + header.m_payloadBytes;
+    if (size < expectedSize)
+    {
+        error = Error::TruncatedMessage;
+        return false;
+    }
+    if (size > expectedSize)
+    {
+        error = Error::TrailingBytes;
+        return false;
+    }
+
+    const std::uint8_t* payload = data + c_headerBytes;
+    if (!ValidatePayload(header, header.m_payloadBytes == 0U ? nullptr : payload, header.m_payloadBytes, error))
+    {
+        return false;
+    }
+    error = Error::None;
+    return true;
+}
+
+bool PreparePcmMessage(std::uint64_t epoch, std::uint64_t sequence, std::size_t payloadBytes, OwnedWireMessage& out, Error& error) noexcept
+{
+    if (payloadBytes > c_maxPayloadBytes)
+    {
+        error = Error::PayloadTooLarge;
+        return false;
+    }
+
+    Header header{};
+    header.m_type = MessageType::Pcm;
+    header.m_epoch = epoch;
+    header.m_sequence = sequence;
+    header.m_payloadBytes = static_cast<std::uint32_t>(payloadBytes);
+    if (!ValidateHeaderFields(header, error))
+    {
+        return false;
+    }
+
+    try
+    {
+        // Resize retains the existing PCM prefix on shrink and reuses capacity
+        // on steady-size frames. The payload begins at a stable 32-byte offset.
+        out.m_bytes.resize(c_headerBytes + payloadBytes);
+    }
+    catch (...)
+    {
+        error = Error::AllocationFailure;
+        return false;
+    }
+
+    WriteHeader(header, out.m_bytes.data());
+    error = Error::None;
+    return true;
+}
+
 bool ValidateMessage(const Message& message, Error& error) noexcept
 {
     if (message.m_payload.size() > c_maxPayloadBytes)
@@ -432,10 +496,39 @@ bool EncodeMessage(const Message& message, std::vector<std::uint8_t>& out, Error
     }
 
     const std::size_t totalSize = c_headerBytes + message.m_payload.size();
-    std::vector<std::uint8_t> encoded;
+    if (&out == &message.m_payload)
+    {
+        // Preserve the historical behavior when callers choose the message's
+        // own payload vector as the output destination. The header overwrites
+        // bytes that are still needed as the source payload, so this uncommon
+        // alias case requires a temporary buffer.
+        std::vector<std::uint8_t> encoded;
+        try
+        {
+            encoded.resize(totalSize);
+        }
+        catch (const std::bad_alloc&)
+        {
+            error = Error::AllocationFailure;
+            return false;
+        }
+
+        WriteHeader(message.m_header, encoded.data());
+        if (!message.m_payload.empty())
+        {
+            std::copy(message.m_payload.begin(), message.m_payload.end(), encoded.begin() + static_cast<std::ptrdiff_t>(c_headerBytes));
+        }
+        out.swap(encoded);
+        error = Error::None;
+        return true;
+    }
+
     try
     {
-        encoded.resize(totalSize);
+        // Resize the caller-owned buffer in place. For a session that emits
+        // repeated messages up to a stable maximum size, capacity is retained
+        // after the first growth and no further wire-buffer allocation occurs.
+        out.resize(totalSize);
     }
     catch (const std::bad_alloc&)
     {
@@ -443,12 +536,11 @@ bool EncodeMessage(const Message& message, std::vector<std::uint8_t>& out, Error
         return false;
     }
 
-    WriteHeader(message.m_header, encoded.data());
+    WriteHeader(message.m_header, out.data());
     if (!message.m_payload.empty())
     {
-        std::copy(message.m_payload.begin(), message.m_payload.end(), encoded.begin() + static_cast<std::ptrdiff_t>(c_headerBytes));
+        std::copy(message.m_payload.begin(), message.m_payload.end(), out.begin() + static_cast<std::ptrdiff_t>(c_headerBytes));
     }
-    out.swap(encoded);
     error = Error::None;
     return true;
 }

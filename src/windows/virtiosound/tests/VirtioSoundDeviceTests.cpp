@@ -596,17 +596,17 @@ void TestRxUsedPublicationPrecedesValidMsi(FakeHost& host)
     Assert(device->PumpCapture(16) == 16, "RX pump completes one available capture period", host);
     Assert(
         host.msiCalls == 1 && host.msiAddress == 0xfee00000 && host.msiData == 0x55,
-        "RX completion delivers the configured valid MSI-X vector despite NO_NOTIFY",
+        "RX completion delivers the configured valid MSI-X vector with RX kicks enabled",
         host);
     Assert(host.msiObservedExpectedRxPublication, "MSI callback observes the used entry and used index already published", host);
     Assert(
         Get(host, 0x9002, 2) == 1 && Get(host, 0x9004, 4) == 0 && Get(host, 0x9008, 4) == 72,
         "RX used ring retains the completed head and full length",
         host);
-    Assert(Get(host, 0x9000, 2) == 1, "RX used flags retain NO_NOTIFY after a data completion", host);
+    Assert(Get(host, 0x9000, 2) == 0, "RX used flags keep notifications enabled after a data completion", host);
 }
 
-void TestRxNoNotifyInitializationAndQueueIsolation(FakeHost& host)
+void TestRxNotificationInitializationAndQueueIsolation(FakeHost& host)
 {
     ClearGuestMemory(host);
     ResetMsiProbe(host);
@@ -630,7 +630,7 @@ void TestRxNoNotifyInitializationAndQueueIsolation(FakeHost& host)
         host);
 
     // Modern virtio-pci drivers can configure queues after FEATURES_OK but before
-    // DRIVER_OK. Writing the suppression hint must not consume a buffer or notify.
+    // DRIVER_OK. Writing the notification policy must not consume a buffer or notify.
     BarWrite(*device, 8, 1, 4);  // driver feature page 1
     BarWrite(*device, 12, 1, 4); // accept VERSION_1 only
     BarWrite(*device, 20, 1, 1);
@@ -648,10 +648,10 @@ void TestRxNoNotifyInitializationAndQueueIsolation(FakeHost& host)
         Get(host, 0x3000, 2) == 0 && Get(host, 0x6000, 2) == 0 && Get(host, 0xa000, 2) == 0,
         "Control, event, and TX used flags remain initialized to zero",
         host);
-    Assert(Get(host, 0xd000, 2) == 1, "RX used flags contain VIRTQ_USED_F_NO_NOTIFY", host);
+    Assert(Get(host, 0xd000, 2) == 0, "RX used flags request available-buffer notifications", host);
     Assert(
         host.rxFlagsWriteObserved && host.rxFlagsWriteSawQueueDisabled,
-        "RX NO_NOTIFY is written before queue_enable becomes visible",
+        "RX notification policy is written before queue_enable becomes visible",
         host);
     Assert(
         Get(host, 0xd002, 2) == 0 && host.msiCalls == 0,
@@ -666,10 +666,10 @@ void TestRxNoNotifyInitializationAndQueueIsolation(FakeHost& host)
     ClearGuestMemory(host);
     Negotiate(*device);
     ConfigureQueue(*device, 3, 0xb000, 0xc000, 0xd000);
-    Assert(Get(host, 0xd000, 2) == 1, "Reset followed by queue re-enable restores RX NO_NOTIFY", host);
+    Assert(Get(host, 0xd000, 2) == 0, "Reset followed by queue re-enable requests RX notifications", host);
 }
 
-void TestRxNoNotifyInitializationFailureLeavesQueueDisabled(FakeHost& host)
+void TestRxNotificationInitializationFailureLeavesQueueDisabled(FakeHost& host)
 {
     ClearGuestMemory(host);
     auto device = Create(host);
@@ -888,8 +888,8 @@ int main()
         TestAddressOverflowAndMsix(host);
         TestFormatAndSyntheticCapture(host);
         TestPendingRxChainCacheAndReset(host);
-        TestRxNoNotifyInitializationAndQueueIsolation(host);
-        TestRxNoNotifyInitializationFailureLeavesQueueDisabled(host);
+        TestRxNotificationInitializationAndQueueIsolation(host);
+        TestRxNotificationInitializationFailureLeavesQueueDisabled(host);
         TestInvalidRxQueueDoesNotWriteGuestMemory(host);
         TestRxUsedPublicationPrecedesValidMsi(host);
         TestRxMaskedPbaUnmasksExactlyOnce(host);
@@ -897,7 +897,7 @@ int main()
         TestRxQueueNotifyDoesNotConsumeBeforePump(host);
         TestSourceXrunAndReleaseDrain(host);
         std::cout << "PASS: native virtio-sound core "
-                  << host.assertions << " assertions; malformed control/descriptor, GPA overflow, RX notification suppression, MSI-X, and reset paths.\n";
+                  << host.assertions << " assertions; malformed control/descriptor, GPA overflow, RX notification policy, MSI-X, and reset paths.\n";
         return 0;
     }
     catch (const std::exception& error)

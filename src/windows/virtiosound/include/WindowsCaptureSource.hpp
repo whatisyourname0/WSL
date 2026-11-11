@@ -20,6 +20,8 @@
 
 namespace wsl::virtio_sound::native::windows {
 
+class CaptureWakeSignal;
+
 // Real capture source backed by an adjacent, user-session worker process.
 // Construction owns a duplicated restricted token and starts supervision, but
 // does not open a capture endpoint. Guest stream transitions only reset the
@@ -28,7 +30,11 @@ namespace wsl::virtio_sound::native::windows {
 class WindowsCaptureSource final : public PcmSource
 {
 public:
-    static std::shared_ptr<WindowsCaptureSource> Create(HANDLE restrictedUserToken, const std::wstring& workerPath, const std::wstring& endpointId);
+    static std::shared_ptr<WindowsCaptureSource> Create(
+        HANDLE restrictedUserToken,
+        const std::wstring& workerPath,
+        const std::wstring& endpointId,
+        std::shared_ptr<CaptureWakeSignal> wakeSignal = {});
 
     ~WindowsCaptureSource() override;
 

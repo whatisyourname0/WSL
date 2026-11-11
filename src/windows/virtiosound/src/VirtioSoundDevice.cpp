@@ -11,6 +11,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -47,7 +48,6 @@ namespace {
     constexpr std::uint32_t c_pcmFeatureXruns = 1U << 4;
     constexpr std::uint32_t c_supportedPcmFeatures = c_pcmFeatureXruns;
     constexpr std::uint64_t c_deviceFeatures = 1ULL << 32;     // VIRTIO_F_VERSION_1
-    constexpr std::uint16_t c_virtqUsedFlagNoNotify = 1;       // VIRTQ_USED_F_NO_NOTIFY; EVENT_IDX is not advertised
     constexpr std::uint64_t c_supportedFormatMask = 1ULL << 5; // S16_LE
     constexpr std::uint32_t c_maxPcmPayloadBytes = 1024 * 1024 - 12;
 
@@ -83,6 +83,18 @@ namespace {
         if (value != std::numeric_limits<std::uint64_t>::max())
         {
             ++value;
+        }
+    }
+
+    void Accumulate(std::uint64_t& value, std::uint64_t amount) noexcept
+    {
+        if (std::numeric_limits<std::uint64_t>::max() - value < amount)
+        {
+            value = std::numeric_limits<std::uint64_t>::max();
+        }
+        else
+        {
+            value += amount;
         }
     }
 
@@ -202,6 +214,7 @@ public:
     PcmFormat m_format;
     int m_rateIndex{};
     std::uint32_t m_frameBytes{};
+    std::vector<std::uint8_t> m_pcmScratch;
     // This portable core uses the standard lock types so its standalone CMake target stays WIL-free.
     mutable std::recursive_mutex m_gate;
     std::array<std::uint8_t, 256> m_pci{};
@@ -226,6 +239,19 @@ public:
     std::uint64_t m_interruptApiRequests{};
     std::uint64_t m_interruptApiSuccesses{};
     std::uint64_t m_interruptApiFailures{};
+    std::uint64_t m_capturePumpCalls{};
+    std::uint64_t m_capturePumpRequestedFrames{};
+    std::uint64_t m_capturePumpCompletedFrames{};
+    std::uint64_t m_capturePumpNoProgressCalls{};
+    std::uint64_t m_captureElapsedPumpCalls{};
+    std::uint64_t m_captureElapsedNanoseconds{};
+    std::uint64_t m_captureMaximumElapsedNanoseconds{};
+    std::uint16_t m_captureMaximumRxOutstandingAvailable{};
+    std::uint32_t m_captureMaximumSourceAvailableFrames{};
+    std::uint64_t m_captureScratchCapacityGrowths{};
+    std::array<std::uint64_t, 6> m_captureBacklogSamples{};
+    std::uint64_t m_captureReleaseCompletions{};
+    std::uint64_t m_captureErrorCompletions{};
     std::uint16_t m_queueSelect{};
     std::uint16_t m_configVector{0xffff};
     std::uint8_t m_status{};
@@ -439,15 +465,16 @@ public:
                 }
                 else
                 {
-                    // RX is consumed by PumpCapture, not by queue kicks. Advise the
-                    // driver that it need not synchronously notify us after adding
-                    // RX buffers. Publish this device-owned used-ring metadata only
+                    // RX kicks wake the owning loop but never transfer PCM inside
+                    // this callback. Keep notifications enabled so reposted buffers
+                    // can wake a source that has data but is waiting for RX. Publish
+                    // this device-owned used-ring metadata only
                     // after validating the queue, and do not expose an enabled RX
                     // queue if guest memory rejects the write.
                     if (queue == &m_queues[3])
                     {
                         std::array<std::uint8_t, 2> flags{};
-                        WriteLe(flags.data(), 0, c_virtqUsedFlagNoNotify, flags.size());
+                        WriteLe(flags.data(), 0, 0, flags.size());
                         try
                         {
                             WriteGuest(queue->m_usedRing, flags.data(), flags.size());
@@ -737,6 +764,22 @@ public:
             {
                 return StatusResponse(c_statusNotSupported);
             }
+        }
+        // An idle device needs no PCM scratch. Commit its bounded allocation
+        // on the first valid configuration, before capture can start, then
+        // retain it across resets and later configurations. The full transport
+        // bound preserves support for legal RX chains larger than one period.
+        if (m_pcmScratch.empty())
+        {
+            try
+            {
+                m_pcmScratch.resize(c_maxPcmPayloadBytes);
+            }
+            catch (const std::bad_alloc&)
+            {
+                return StatusResponse(c_statusIoError);
+            }
+            Increment(m_captureScratchCapacityGrowths);
         }
         StopSource();
         m_bufferBytes = newBufferBytes;
@@ -1113,20 +1156,67 @@ public:
 
     void CaptureError(const Chain& chain, std::uint32_t statusCode, std::uint32_t origin)
     {
-        TraceCapture(L"CaptureStatusError", statusCode, origin);
+        // RELEASE returns unused RX descriptors with IO_ERR by protocol; it
+        // is not evidence of a capture failure. Keep the wire status unchanged.
+        if (origin == 5)
+        {
+            Increment(m_captureReleaseCompletions);
+            TraceCapture(L"CaptureReleaseBuffer", statusCode, origin);
+        }
+        else
+        {
+            Increment(m_captureErrorCompletions);
+            TraceCapture(L"CaptureStatusError", statusCode, origin);
+        }
         std::array<std::uint8_t, 8> tail{};
         WriteLe(tail.data(), 0, statusCode, 4);
         Scatter(chain, chain.m_capacity - 8, tail.data(), tail.size());
         Complete(m_queues[3], chain, 8, false, true);
     }
 
-    int PumpCapture(int frameBudget)
+    void ObserveRxBacklog() noexcept
+    {
+        const std::uint16_t outstanding = static_cast<std::uint16_t>(m_queues[3].m_observedAvailable - m_queues[3].m_lastAvailable);
+        m_captureMaximumRxOutstandingAvailable = (std::max)(m_captureMaximumRxOutstandingAvailable, outstanding);
+    }
+
+    void ObserveSourceBacklog(const std::optional<std::uint32_t>& availableFrames) noexcept
+    {
+        if (availableFrames.has_value())
+        {
+            m_captureMaximumSourceAvailableFrames = (std::max)(m_captureMaximumSourceAvailableFrames, *availableFrames);
+        }
+    }
+
+    int PumpCapture(int frameBudget, bool* rxUnavailable = nullptr)
     {
         if (frameBudget < 0 || frameBudget > static_cast<int>(c_maxTransferBytes / m_frameBytes))
         {
             throw std::out_of_range("Capture frame budget is outside the bounded transfer size");
         }
         std::lock_guard<std::recursive_mutex> lock(m_gate);
+        Increment(m_capturePumpCalls);
+        Accumulate(m_capturePumpRequestedFrames, static_cast<std::uint64_t>(frameBudget));
+        int completed = 0;
+        try
+        {
+            completed = PumpCaptureCore(frameBudget, rxUnavailable);
+        }
+        catch (...)
+        {
+            Increment(m_capturePumpNoProgressCalls);
+            throw;
+        }
+        Accumulate(m_capturePumpCompletedFrames, static_cast<std::uint64_t>(completed));
+        if (completed == 0)
+        {
+            Increment(m_capturePumpNoProgressCalls);
+        }
+        return completed;
+    }
+
+    int PumpCaptureCore(int frameBudget, bool* rxUnavailable)
+    {
         if (!Ready() || !IsRunning())
         {
             return 0;
@@ -1160,7 +1250,9 @@ public:
                 for (int n = 0; n < c_maxQueueSize; ++n)
                 {
                     Chain chain;
-                    if (PeekRx(chain) == nullptr)
+                    Chain* available = PeekRx(chain);
+                    ObserveRxBacklog();
+                    if (available == nullptr)
                     {
                         break;
                     }
@@ -1192,6 +1284,7 @@ public:
         if (m_pcmSource)
         {
             const std::optional<std::uint32_t> availableFrames = m_pcmSource->AvailableFrames();
+            ObserveSourceBacklog(availableFrames);
             if (availableFrames.has_value())
             {
                 const std::uint32_t maximumFrames = VirtioSoundDevice::c_maxTransferBytes / m_frameBytes;
@@ -1205,8 +1298,14 @@ public:
             for (int n = 0; n < c_maxQueueSize; ++n)
             {
                 Chain chain;
-                if (PeekRx(chain) == nullptr)
+                Chain* available = PeekRx(chain);
+                ObserveRxBacklog();
+                if (available == nullptr)
                 {
+                    if (rxUnavailable != nullptr)
+                    {
+                        *rxUnavailable = true;
+                    }
                     break;
                 }
                 if (chain.m_capacity < 8)
@@ -1226,11 +1325,10 @@ public:
                     m_pendingRx = chain;
                     break;
                 }
-                std::vector<std::uint8_t> payload(payloadLength);
                 bool generated = false;
                 try
                 {
-                    generated = GenerateFrames(needed, payload.data(), payload.size());
+                    generated = GenerateFrames(needed, m_pcmScratch.data(), payloadLength);
                 }
                 catch (...)
                 {
@@ -1243,7 +1341,7 @@ public:
                     LatchXrun();
                     continue;
                 }
-                Scatter(chain, 0, payload.data(), payload.size());
+                Scatter(chain, 0, m_pcmScratch.data(), payloadLength);
                 std::array<std::uint8_t, 8> tail{};
                 WriteLe(tail.data(), 0, c_statusOk, 4); // latency is not supplied by this source API
                 Scatter(chain, payloadLength, tail.data(), tail.size());
@@ -1258,9 +1356,17 @@ public:
         return frames;
     }
 
-    int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds)
+    int PumpCaptureElapsed(std::uint64_t elapsedNanoseconds, bool allowTransfer = true,
+        std::uint32_t frameLimit = (std::numeric_limits<std::uint32_t>::max)(), bool* rxUnavailable = nullptr)
     {
         std::lock_guard<std::recursive_mutex> lock(m_gate);
+        if (rxUnavailable != nullptr)
+        {
+            *rxUnavailable = false;
+        }
+        Increment(m_captureElapsedPumpCalls);
+        Accumulate(m_captureElapsedNanoseconds, elapsedNanoseconds);
+        m_captureMaximumElapsedNanoseconds = (std::max)(m_captureMaximumElapsedNanoseconds, elapsedNanoseconds);
         if (m_pendingStartControl.has_value())
         {
             try
@@ -1306,7 +1412,7 @@ public:
             {
                 return 0;
             }
-            return PumpCapture(0);
+            return PumpCapture(0, rxUnavailable);
         }
         if (!m_queues[3].m_enabled)
         {
@@ -1317,12 +1423,17 @@ public:
         if (m_pcmSource)
         {
             const std::optional<std::uint32_t> availableFrames = m_pcmSource->AvailableFrames();
+            ObserveSourceBacklog(availableFrames);
             if (availableFrames.has_value())
             {
                 // The source queue already advances on its capture clock.
                 // Never add wall-clock credit to it, and let its first ready
                 // buffer through even on the first tick after START.
                 m_elapsedFrameCredit = 0;
+                if (!allowTransfer)
+                {
+                    return 0;
+                }
                 const std::uint32_t maximumFrames = VirtioSoundDevice::c_maxTransferBytes / m_frameBytes;
                 std::uint32_t maximumBurstFrames = maximumFrames;
                 const std::uint32_t bufferFrames = m_bufferBytes / m_frameBytes;
@@ -1335,7 +1446,7 @@ public:
                     maximumBurstFrames = (std::min)(maximumBurstFrames, bufferFrames - periodFrames);
                 }
                 const std::uint32_t availableBudget = (std::min)(*availableFrames, maximumBurstFrames);
-                return PumpCapture(static_cast<int>(availableBudget));
+                return PumpCapture(static_cast<int>((std::min)(availableBudget, frameLimit)), rxUnavailable);
             }
         }
 
@@ -1350,10 +1461,74 @@ public:
         const std::uint32_t maxFrames = VirtioSoundDevice::c_maxTransferBytes / m_frameBytes;
         long double added = static_cast<long double>(elapsedNanoseconds) * m_format.m_sampleRate / 1000000000.0L;
         m_elapsedFrameCredit = std::min(static_cast<long double>(maxFrames), m_elapsedFrameCredit + added);
-        int budget = static_cast<int>(std::min(m_elapsedFrameCredit, static_cast<long double>(maxFrames)));
-        int completed = PumpCapture(budget);
+        if (!allowTransfer)
+        {
+            return 0;
+        }
+        int budget = static_cast<int>(std::min(m_elapsedFrameCredit, static_cast<long double>((std::min)(maxFrames, frameLimit))));
+        int completed = PumpCapture(budget, rxUnavailable);
         m_elapsedFrameCredit = std::max(0.0L, m_elapsedFrameCredit - completed);
         return completed;
+    }
+
+    CaptureServiceResult ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_gate);
+        CaptureServiceResult result;
+        const auto before = m_pcmSource ? m_pcmSource->AvailableFrames() : std::nullopt;
+        if (Ready() && IsRunning() && CurrentSourceReadiness() == SourceReadiness::Ready && before.has_value() && m_periodBytes != 0)
+        {
+            const std::uint64_t period = m_periodBytes / m_frameBytes;
+            const std::uint64_t frames = *before;
+            const std::size_t bucket = frames == 0           ? 0
+                                       : frames < period     ? 1
+                                       : frames < 2 * period ? 2
+                                       : frames < 4 * period ? 3
+                                       : frames < 8 * period ? 4
+                                                             : 5;
+            Increment(m_captureBacklogSamples[bucket]);
+        }
+        bool rxUnavailable = false;
+        result.m_frames = PumpCaptureElapsed(elapsedNanoseconds, allowTransfer, m_periodBytes / m_frameBytes, &rxUnavailable);
+        result.m_generation = m_pacingGeneration;
+        result.m_periodFrames = m_periodBytes / m_frameBytes;
+        result.m_sampleRate = m_format.m_sampleRate;
+        const auto available = m_pcmSource ? m_pcmSource->AvailableFrames() : std::nullopt;
+        result.m_sourceClocked = available.has_value();
+        result.m_sourceAvailableFrames = available.value_or(0);
+        result.m_moreSourceFrames = available.has_value() && result.m_periodFrames != 0 && *available >= result.m_periodFrames;
+        if (!Ready() || !IsRunning())
+        {
+            result.m_waitReason = CaptureWaitReason::Idle;
+        }
+        else if (CurrentSourceReadiness() == SourceReadiness::Failed)
+        {
+            result.m_waitReason = CaptureWaitReason::Failed;
+        }
+        else if (CurrentSourceReadiness() == SourceReadiness::Pending)
+        {
+            result.m_waitReason = CaptureWaitReason::Readiness;
+        }
+        else if (result.m_frames != 0)
+        {
+            result.m_waitReason = CaptureWaitReason::Progress;
+        }
+        else if (!allowTransfer)
+        {
+            result.m_waitReason = CaptureWaitReason::PacingDeadline;
+        }
+        else if (available.has_value() && !result.m_moreSourceFrames)
+        {
+            result.m_waitReason = CaptureWaitReason::SourceData;
+        }
+        else
+        {
+            // Source data can arrive between the budget and final snapshots.
+            // Only an observed empty RX queue permits waiting for a guest kick;
+            // a retained descriptor must still be woken by the source event.
+            result.m_waitReason = rxUnavailable ? CaptureWaitReason::RxBuffer : CaptureWaitReason::SourceData;
+        }
+        return result;
     }
 
     bool CaptureRunning() const
@@ -1537,6 +1712,20 @@ public:
         snapshot.m_interruptApiRequests = m_interruptApiRequests;
         snapshot.m_interruptApiSuccesses = m_interruptApiSuccesses;
         snapshot.m_interruptApiFailures = m_interruptApiFailures;
+        snapshot.m_capturePumpCalls = m_capturePumpCalls;
+        snapshot.m_capturePumpRequestedFrames = m_capturePumpRequestedFrames;
+        snapshot.m_capturePumpCompletedFrames = m_capturePumpCompletedFrames;
+        snapshot.m_capturePumpNoProgressCalls = m_capturePumpNoProgressCalls;
+        snapshot.m_captureElapsedPumpCalls = m_captureElapsedPumpCalls;
+        snapshot.m_captureElapsedNanoseconds = m_captureElapsedNanoseconds;
+        snapshot.m_captureMaximumElapsedNanoseconds = m_captureMaximumElapsedNanoseconds;
+        snapshot.m_captureMaximumRxOutstandingAvailable = m_captureMaximumRxOutstandingAvailable;
+        snapshot.m_captureMaximumSourceAvailableFrames = m_captureMaximumSourceAvailableFrames;
+        snapshot.m_captureScratchCapacityGrowths = m_captureScratchCapacityGrowths;
+        snapshot.m_captureScratchCapacityBytes = m_pcmScratch.capacity();
+        snapshot.m_captureBacklogSamples = m_captureBacklogSamples;
+        snapshot.m_captureReleaseCompletions = m_captureReleaseCompletions;
+        snapshot.m_captureErrorCompletions = m_captureErrorCompletions;
         return snapshot;
     }
 };
@@ -1583,6 +1772,11 @@ int VirtioSoundDevice::PumpCapture(int frameBudget)
 int VirtioSoundDevice::PumpCaptureElapsed(std::uint64_t elapsedNanoseconds)
 {
     return m_impl->PumpCaptureElapsed(elapsedNanoseconds);
+}
+
+CaptureServiceResult VirtioSoundDevice::ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer)
+{
+    return m_impl->ServiceCapture(elapsedNanoseconds, allowTransfer);
 }
 bool VirtioSoundDevice::CaptureRunning() const noexcept
 {

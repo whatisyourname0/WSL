@@ -31,6 +31,7 @@ class MockBackend:
         self.closed = False
         self.read_calls = 0
         self.wait_calls = 0
+        self.sample_cursor = 0
 
     def open(self, device):
         self.opened_device = device
@@ -62,7 +63,8 @@ class MockBackend:
         else:
             result = frames
         for index in range(result * 2):
-            buffer[index] = self.samples[index % len(self.samples)]
+            buffer[index] = self.samples[(self.sample_cursor + index) % len(self.samples)]
+        self.sample_cursor += result * 2
         return result
 
     def close(self, handle):
@@ -101,12 +103,93 @@ class CaptureProbeTests(unittest.TestCase):
 
     def test_epipe_is_reported_as_xrun_without_recovery_and_closes(self):
         backend = MockBackend(read_results=[-errno.EPIPE])
+        telemetry = []
 
         with self.assertRaisesRegex(XRunError, "XRUN.*no recovery attempted"):
-            capture(backend, "hw:0,0", 1)
+            capture(backend, "hw:0,0", 1, telemetry=telemetry.append)
 
         self.assertEqual(backend.read_calls, 1)
+        self.assertEqual([event["type"] for event in telemetry], ["stream_setup"])
         self.assertTrue(backend.closed)
+
+    def test_telemetry_tracks_channel_extrema_across_short_reads_and_window_boundaries(self):
+        backend = MockBackend(
+            read_results=[3, 7],
+            samples=(-32_768, 32_767, 0, 0),
+            params=(88_888, 1_111),
+        )
+        telemetry = []
+
+        result = capture(
+            backend,
+            "hw:2,1",
+            2,
+            chunk_frames=20_000,
+            telemetry=telemetry.append,
+        )
+
+        self.assertEqual(result.frames, 96_000)
+        self.assertEqual(telemetry[0], {
+            "type": "stream_setup",
+            "rate_hz": 48_000,
+            "channels": 2,
+            "format": "S16_LE",
+            "buffer_frames": 88_888,
+            "period_frames": 1_111,
+        })
+        windows = [event for event in telemetry if event["type"] == "window"]
+        self.assertEqual([event["frames"] for event in windows], [48_000, 48_000])
+        for event in windows:
+            channel_0, channel_1 = event["channels"]
+            self.assertEqual(channel_0["channel"], 0)
+            self.assertEqual(channel_0["samples"], 48_000)
+            self.assertEqual(channel_0["negative_full_scale_samples"], 24_000)
+            self.assertEqual(channel_0["positive_full_scale_samples"], 0)
+            self.assertEqual(channel_0["peak"], 32_768)
+            self.assertEqual(channel_0["longest_zero_run_samples"], 1)
+            self.assertEqual(channel_0["dc_offset"], -16_384.0)
+            self.assertEqual(channel_1["channel"], 1)
+            self.assertEqual(channel_1["samples"], 48_000)
+            self.assertEqual(channel_1["negative_full_scale_samples"], 0)
+            self.assertEqual(channel_1["positive_full_scale_samples"], 24_000)
+            self.assertEqual(channel_1["peak"], 32_767)
+            self.assertEqual(channel_1["longest_zero_run_samples"], 1)
+            self.assertEqual(channel_1["dc_offset"], 16_383.5)
+
+        aggregate = telemetry[-1]
+        self.assertEqual(aggregate["type"], "aggregate")
+        self.assertEqual(aggregate["frames"], 96_000)
+        self.assertEqual(aggregate["channels"][0]["negative_full_scale_samples"], 48_000)
+        self.assertEqual(aggregate["channels"][1]["positive_full_scale_samples"], 48_000)
+        self.assertEqual(aggregate["channels"][0]["rms"], round(math.sqrt(32_768**2 / 2), 6))
+        self.assertEqual(aggregate["channels"][1]["rms"], round(math.sqrt(32_767**2 / 2), 6))
+
+    def test_telemetry_zero_run_spans_reads_and_aggregate_spans_windows(self):
+        backend = MockBackend(read_results=[3, 7], samples=(0, 0))
+        telemetry = []
+
+        capture(
+            backend,
+            "hw:0,0",
+            2,
+            chunk_frames=20_000,
+            telemetry=telemetry.append,
+        )
+
+        windows = [event for event in telemetry if event["type"] == "window"]
+        self.assertEqual(len(windows), 2)
+        self.assertEqual([(event["start_frame"], event["end_frame"]) for event in windows],
+                         [(0, 48_000), (48_000, 96_000)])
+        for event in windows:
+            self.assertEqual(
+                [channel["longest_zero_run_samples"] for channel in event["channels"]],
+                [48_000, 48_000],
+            )
+        aggregate = telemetry[-1]
+        self.assertEqual(
+            [channel["longest_zero_run_samples"] for channel in aggregate["channels"]],
+            [96_000, 96_000],
+        )
 
     def test_xrun_diagnostics_track_frames_elapsed_loop_gap_and_params(self):
         clock = FakeClock()
@@ -164,6 +247,30 @@ class CaptureProbeTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(set(payload), {"frames", "samples", "rms", "peak", "nonzero_samples"})
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_main_telemetry_keeps_success_json_unchanged_and_streams_to_stderr(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with patch.object(probe, "NativeAlsaBackend", return_value=MockBackend()):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = probe.main(
+                    [
+                        "--device", "hw:0,0", "--duration", "1",
+                        "--acknowledge-microphone-access", "--telemetry",
+                    ]
+                )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(set(payload), {"frames", "samples", "rms", "peak", "nonzero_samples"})
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(all(line.startswith("alsa_capture_probe_telemetry: ") for line in lines))
+        events = [json.loads(line.split(": ", 1)[1]) for line in lines]
+        self.assertEqual([event["type"] for event in events], ["stream_setup", "window", "aggregate"])
+        self.assertEqual(events[0]["buffer_frames"], 96_000)
+        self.assertEqual(events[0]["period_frames"], 2_048)
 
     def test_wait_timeout_hits_monotonic_deadline_and_closes(self):
         clock = FakeClock()

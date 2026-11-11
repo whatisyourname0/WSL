@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -16,8 +17,12 @@
 #include <wil/resource.h>
 #include <wil/result.h>
 
+#include "CaptureEventScheduler.hpp"
+#include "CaptureHostTimingDiagnostics.hpp"
 #include "HdvPciDeviceHost.hpp"
 #include "WindowsCaptureSource.hpp"
+#include "../../virtiosound/include/GuestStopPreparation.hpp"
+#include "../../virtiosound/src/windows/AudioSourceTrace.hpp"
 
 namespace wsl::virtio_sound::process_host {
 constexpr std::uint32_t c_startupMagic = 0x48565341;
@@ -62,14 +67,17 @@ inline int Run(int argc, wchar_t** argv) noexcept
     wil::unique_handle output;
     try
     {
-        THROW_HR_IF(E_INVALIDARG, argc != 8);
+        THROW_HR_IF(E_INVALIDARG, argc != 11);
         output.reset(ParseHandle(argv[4]));
         RequireSystemHighToken();
         const auto stop = ParseHandle(argv[5]);
         const auto parent = ParseHandle(argv[6]);
-        wil::unique_handle configuration{ParseHandle(argv[7])};
+        const auto prepareRequest = ParseHandle(argv[7]);
+        const auto prepareSucceeded = ParseHandle(argv[8]);
+        const auto prepareFailed = ParseHandle(argv[9]);
+        wil::unique_handle configuration{ParseHandle(argv[10])};
         DWORD flags{};
-        for (const auto handle : {output.get(), stop, parent, configuration.get()})
+        for (const auto handle : {output.get(), stop, parent, prepareRequest, prepareSucceeded, prepareFailed, configuration.get()})
         {
             THROW_IF_WIN32_BOOL_FALSE(GetHandleInformation(handle, &flags));
             THROW_HR_IF(E_ACCESSDENIED, !(flags & HANDLE_FLAG_INHERIT));
@@ -95,6 +103,7 @@ inline int Run(int argc, wchar_t** argv) noexcept
         using unique_hcs_system = wil::unique_any<HCS_SYSTEM, decltype(&HcsCloseComputeSystem), HcsCloseComputeSystem>;
         unique_hcs_system system;
         THROW_IF_FAILED(HcsOpenComputeSystem(argv[2], GENERIC_ALL, &system));
+        auto captureWake = std::make_shared<native::windows::CaptureWakeSignal>();
         std::shared_ptr<native::windows::WindowsCaptureSource> source;
         auto shutdownSource = wil::scope_exit([&] {
             if (source)
@@ -113,25 +122,95 @@ inline int Run(int argc, wchar_t** argv) noexcept
             const auto length = GetModuleFileNameW(nullptr, image, ARRAYSIZE(image));
             THROW_LAST_ERROR_IF(!length || length == ARRAYSIZE(image));
             const auto worker = std::filesystem::path(image).parent_path() / L"wsl-audio-worker.exe";
-            source = native::windows::WindowsCaptureSource::Create(userToken.get(), worker.wstring(), startup.m_endpoint);
+            source = native::windows::WindowsCaptureSource::Create(userToken.get(), worker.wstring(), startup.m_endpoint, captureWake);
         }
         constexpr GUID c_deviceClass{0xF1919B41, 0x6A33, 0x4C92, {0xA7, 0xF8, 0x39, 0x7E, 0xE4, 0xC5, 0xB1, 0xD2}};
         auto host = native::windows::HdvPciDeviceHost::CreateBorrowed(
-            system.get(), c_deviceClass, instance, source, native::windows::HostOwnership::UnknownOrShared);
+            system.get(), c_deviceClass, instance, source, native::windows::HostOwnership::UnknownOrShared, captureWake);
         packet.m_result = S_OK;
         DWORD written{};
         THROW_IF_WIN32_BOOL_FALSE(WriteFile(output.get(), &packet, sizeof(packet), &written, nullptr));
         THROW_HR_IF(E_FAIL, written != sizeof(packet));
         output.reset();
         using clock = std::chrono::steady_clock;
-        auto last = clock::now();
-        const HANDLE waits[]{stop, parent};
+        const auto clockOrigin = clock::now();
+        auto lastPump = clockOrigin;
+        auto toNanoseconds = [&](clock::time_point time) {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(time - clockOrigin).count());
+        };
+        detail::CaptureEventScheduler scheduler;
+        detail::CaptureHostTimingRing timingEvents;
+        [[maybe_unused]] auto traceTimingEvents = wil::scope_exit([&]() noexcept {
+            native::windows::detail::TraceAudioSource(L"HostPumpRing", timingEvents.Count(), timingEvents.TotalRecorded());
+            for (std::size_t index = 0; index < timingEvents.Count(); ++index)
+            {
+                const auto* event = timingEvents.Oldest(index);
+                if (!event)
+                {
+                    continue;
+                }
+
+                wchar_t detailText[190]{};
+                // Compact field order: sequence, flags, wait start/requested/return/actual,
+                // service start/duration, wait result/reason, frames, generation.
+                if (swprintf_s(
+                        detailText,
+                        ARRAYSIZE(detailText),
+                        L"HP %llx %x %llx %llx %llx %llx %llx %llx %x %x %d %llx",
+                        static_cast<unsigned long long>(event->m_sequence),
+                        static_cast<unsigned int>(event->m_flags),
+                        static_cast<unsigned long long>(event->m_waitStartedAtNanoseconds),
+                        static_cast<unsigned long long>(event->m_requestedWaitNanoseconds),
+                        static_cast<unsigned long long>(event->m_waitReturnedAtNanoseconds),
+                        static_cast<unsigned long long>(event->m_actualWaitNanoseconds),
+                        static_cast<unsigned long long>(event->m_serviceStartedAtNanoseconds),
+                        static_cast<unsigned long long>(event->m_serviceDurationNanoseconds),
+                        static_cast<unsigned int>(event->m_waitResult),
+                        static_cast<unsigned int>(event->m_waitReason),
+                        static_cast<int>(event->m_frames),
+                        static_cast<unsigned long long>(event->m_generation)) > 0)
+                {
+                    native::windows::detail::TraceAudioSource(detailText);
+                }
+            }
+        });
+        std::uint64_t eventWakes{}, deadlineWakes{}, emptyServices{}, deferredServices{}, completedFrames{};
+        std::uint64_t sourceWakes{}, guestWakes{}, serviceNanoseconds{}, maximumServiceNanoseconds{};
+        std::uint64_t lastGeneration{};
+        auto lastWaitReason = native::CaptureWaitReason::Idle;
+        native::windows::detail::TraceAudioSource(L"HostPumpClockOrigin", toNanoseconds(clock::now()));
+        // A startup rescan covers state published before this loop began.
+        captureWake->Notify(native::windows::CaptureWakeReason::GuestState);
+        const HANDLE waits[]{stop, parent, prepareRequest, captureWake->Event(), captureWake->DataEvent()};
         for (;;)
         {
-            const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, native::VirtioSoundDevice::c_capturePumpIntervalMs);
+            const auto beforeWait = clock::now();
+            const auto beforeWaitNanoseconds = toNanoseconds(beforeWait);
+            const auto requestedWaitMilliseconds = scheduler.WaitTimeoutMilliseconds(beforeWaitNanoseconds);
+            const bool deferSourceData = scheduler.DeferSourceData(beforeWaitNanoseconds);
+            // Keep stop, parent lifetime, prepare, and source/guest state in
+            // every wait. Only a data-only wake is held until the next rescan.
+            const DWORD waitHandleCount = deferSourceData ? 4U : 5U;
+            const DWORD wait = WaitForMultipleObjects(waitHandleCount, waits, FALSE, requestedWaitMilliseconds);
+            const DWORD waitError = wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+            const auto waitReturned = clock::now();
+            const auto waitReturnedNanoseconds = toNanoseconds(waitReturned);
+            auto recordWaitOnlyIfSlow = [&]() noexcept {
+                (void)timingEvents.RecordIfSlow(
+                    beforeWaitNanoseconds,
+                    requestedWaitMilliseconds,
+                    waitReturnedNanoseconds,
+                    static_cast<std::uint32_t>(wait),
+                    waitReturnedNanoseconds,
+                    0,
+                    static_cast<std::uint8_t>(lastWaitReason),
+                    0,
+                    lastGeneration);
+            };
             if (wait == WAIT_OBJECT_0)
             {
                 // The parent signals stop only after confirming guest shutdown.
+                recordWaitOnlyIfSlow();
                 break;
             }
             if (wait == WAIT_OBJECT_0 + 1)
@@ -139,6 +218,7 @@ inline int Run(int argc, wchar_t** argv) noexcept
                 // Parent death does not prove that the guest stopped. Close the
                 // capture source during unwinding and let process exit release
                 // the process-pinned callback root; never claim guest retirement.
+                recordWaitOnlyIfSlow();
                 if (source)
                 {
                     source->Shutdown();
@@ -146,25 +226,90 @@ inline int Run(int argc, wchar_t** argv) noexcept
                 shutdownSource.release();
                 return ERROR_PROCESS_ABORTED;
             }
+            if (wait == WAIT_OBJECT_0 + 2)
+            {
+                // This runs on the pump thread, outside HDV callbacks. Normal
+                // MMIO callbacks and capture remain live while the guest shuts
+                // down; only the optional doorbell is disarmed.
+                const HRESULT result = host->PrepareForGuestStop();
+                const HANDLE acknowledgement = SUCCEEDED(result) ? prepareSucceeded : prepareFailed;
+                if (!SetEvent(acknowledgement))
+                {
+                    native::windows::detail::TraceAudioSource(
+                        L"HdvGuestStopPrepareAckFailure", static_cast<std::uint32_t>(result), GetLastError());
+                }
+                continue;
+            }
             if (wait == WAIT_FAILED)
             {
                 // Fail closed: unwinding shuts down the source, but leaves the
                 // callback root pinned until this child process exits.
-                THROW_LAST_ERROR();
+                recordWaitOnlyIfSlow();
+                THROW_WIN32(waitError);
             }
-            if (wait != WAIT_TIMEOUT)
+            if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0 + 3 && (deferSourceData || wait != WAIT_OBJECT_0 + 4))
             {
+                recordWaitOnlyIfSlow();
                 THROW_HR(E_UNEXPECTED);
             }
 
-            const auto now = clock::now();
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count();
-            last = now;
-            if (elapsed > 0)
+            const auto pumpStarted = clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(pumpStarted - lastPump).count();
+            // State events never grant sample credit. Always service readiness
+            // and failures, even when the completion-rate deadline is not due.
+            lastPump = pumpStarted;
+            // While source data is deferred, an early state/guest wake may
+            // service state without being allowed to discard the pending data
+            // wake. Drain it only once data is eligible again or the scheduled
+            // deadline itself caused this rescan; otherwise its signal must
+            // survive reason consumption in case service leaves the scheduler
+            // unarmed.
+            if (!deferSourceData || wait == WAIT_TIMEOUT)
             {
-                host->PumpCaptureElapsed(static_cast<std::uint64_t>(elapsed));
+                // A producer racing this drain either contributes to this
+                // rescan or leaves its event signaled for the following one.
+                (void)WaitForSingleObject(captureWake->DataEvent(), 0);
             }
+            const auto reasons = captureWake->Consume();
+            if (wait == WAIT_TIMEOUT)
+            {
+                ++deadlineWakes;
+            }
+            else
+            {
+                ++eventWakes;
+            }
+            sourceWakes += (reasons & 3U) != 0;
+            guestWakes += (reasons & 12U) != 0;
+            const auto startedAt = toNanoseconds(pumpStarted);
+            const bool allowTransfer = scheduler.CanTransfer(startedAt, host->CapturePacingGeneration());
+            const auto result = host->ServiceCapture(elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0, allowTransfer);
+            scheduler.OnService(startedAt, result);
+            const auto duration = toNanoseconds(clock::now()) - startedAt;
+            (void)timingEvents.RecordIfSlow(
+                beforeWaitNanoseconds,
+                requestedWaitMilliseconds,
+                waitReturnedNanoseconds,
+                static_cast<std::uint32_t>(wait),
+                startedAt,
+                duration,
+                static_cast<std::uint8_t>(result.m_waitReason),
+                static_cast<std::int32_t>(result.m_frames),
+                result.m_generation);
+            lastGeneration = result.m_generation;
+            lastWaitReason = result.m_waitReason;
+            serviceNanoseconds += duration;
+            maximumServiceNanoseconds = (std::max)(maximumServiceNanoseconds, duration);
+            emptyServices += result.m_frames == 0;
+            deferredServices += result.m_waitReason == native::CaptureWaitReason::PacingDeadline;
+            completedFrames += static_cast<std::uint64_t>((std::max)(0, result.m_frames));
         }
+        native::windows::detail::TraceAudioSource(L"CaptureWakeTotals", eventWakes, deadlineWakes);
+        native::windows::detail::TraceAudioSource(L"CaptureWakeReasons", sourceWakes, guestWakes);
+        native::windows::detail::TraceAudioSource(L"CaptureDoorbellActive", host->RxDoorbellRegistered() ? 1 : 0);
+        native::windows::detail::TraceAudioSource(L"CaptureServiceEmpty", emptyServices, deferredServices);
+        native::windows::detail::TraceAudioSource(L"CaptureServiceTime", serviceNanoseconds, maximumServiceNanoseconds);
+        native::windows::detail::TraceAudioSource(L"CaptureServiceFrames", completedFrames);
         // The parent confirms guest shutdown before signaling stop. Keep the
         // existing ownership rule: do not tear down another WSL proxy registration.
         (void)host->GuestStoppedAndRetire();
@@ -217,12 +362,25 @@ public:
         THROW_IF_WIN32_BOOL_FALSE(SetHandleInformation(read.get(), HANDLE_FLAG_INHERIT, 0));
         host->m_stop.reset(CreateEventW(&attributes, TRUE, FALSE, nullptr));
         THROW_LAST_ERROR_IF(!host->m_stop);
+        host->m_prepareRequest.reset(CreateEventW(&attributes, FALSE, FALSE, nullptr));
+        THROW_LAST_ERROR_IF(!host->m_prepareRequest);
+        host->m_prepareSucceeded.reset(CreateEventW(&attributes, TRUE, FALSE, nullptr));
+        THROW_LAST_ERROR_IF(!host->m_prepareSucceeded);
+        host->m_prepareFailed.reset(CreateEventW(&attributes, TRUE, FALSE, nullptr));
+        THROW_LAST_ERROR_IF(!host->m_prepareFailed);
         THROW_IF_WIN32_BOOL_FALSE(
             DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &parent, SYNCHRONIZE, TRUE, 0));
         wil::unique_handle configurationRead, configurationWrite, inheritedUserToken;
         THROW_IF_WIN32_BOOL_FALSE(CreatePipe(&configurationRead, &configurationWrite, &attributes, sizeof(StartupPacket)));
         THROW_IF_WIN32_BOOL_FALSE(SetHandleInformation(configurationWrite.get(), HANDLE_FLAG_INHERIT, 0));
-        std::vector<HANDLE> inherited{write.get(), host->m_stop.get(), parent.get(), configurationRead.get()};
+        std::vector<HANDLE> inherited{
+            write.get(),
+            host->m_stop.get(),
+            parent.get(),
+            host->m_prepareRequest.get(),
+            host->m_prepareSucceeded.get(),
+            host->m_prepareFailed.get(),
+            configurationRead.get()};
         if (restrictedUserToken)
         {
             THROW_IF_WIN32_BOOL_FALSE(DuplicateHandle(
@@ -261,7 +419,8 @@ public:
         auto handleText = [](HANDLE h) { return std::to_wstring(reinterpret_cast<ULONG_PTR>(h)); };
         std::wstring command = L"\"" + std::wstring(image) + L"\" --virtio-sound-host " + vm + L" " + instanceText + L" " +
                                handleText(write.get()) + L" " + handleText(host->m_stop.get()) + L" " + handleText(parent.get()) +
-                               L" " + handleText(configurationRead.get());
+                               L" " + handleText(host->m_prepareRequest.get()) + L" " + handleText(host->m_prepareSucceeded.get()) +
+                               L" " + handleText(host->m_prepareFailed.get()) + L" " + handleText(configurationRead.get());
         STARTUPINFOEXW startup{};
         startup.StartupInfo.cb = sizeof(startup);
         startup.lpAttributeList = processAttributes.get();
@@ -333,13 +492,102 @@ public:
         m_guestStoppedConfirmed.store(true, std::memory_order_release);
     }
 
+    HRESULT PrepareForGuestStop() noexcept
+    {
+        bool expected = false;
+        if (!m_prepareAttempted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        {
+            return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+        }
+
+        DWORD requestError = ERROR_GEN_FAILURE;
+        DWORD waitError = ERROR_GEN_FAILURE;
+        const auto outcome = native::windows::detail::GuestStopPreparation::Request(
+            [&] {
+                if (!ResetEvent(m_prepareSucceeded.get()))
+                {
+                    requestError = GetLastError();
+                    return false;
+                }
+                if (!ResetEvent(m_prepareFailed.get()))
+                {
+                    requestError = GetLastError();
+                    return false;
+                }
+                return true;
+            },
+            [&] {
+                if (!SetEvent(m_prepareRequest.get()))
+                {
+                    requestError = GetLastError();
+                    return false;
+                }
+                return true;
+            },
+            [&](std::uint32_t timeoutMilliseconds) {
+                const HANDLE waits[]{m_prepareSucceeded.get(), m_prepareFailed.get(), m_child.get()};
+                const DWORD wait = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, timeoutMilliseconds);
+                if (wait == WAIT_OBJECT_0)
+                {
+                    return native::windows::detail::GuestStopPreparationResult::Prepared;
+                }
+                if (wait == WAIT_OBJECT_0 + 1)
+                {
+                    return native::windows::detail::GuestStopPreparationResult::Rejected;
+                }
+                if (wait == WAIT_OBJECT_0 + 2)
+                {
+                    return native::windows::detail::GuestStopPreparationResult::ChildExited;
+                }
+                if (wait == WAIT_TIMEOUT)
+                {
+                    return native::windows::detail::GuestStopPreparationResult::TimedOut;
+                }
+                waitError = GetLastError();
+                return native::windows::detail::GuestStopPreparationResult::WaitFailed;
+            },
+            [&](native::windows::detail::GuestStopPreparationResult abortReason) noexcept {
+                AbortUnacknowledgedGuestStopPreparation(abortReason);
+            });
+
+        HRESULT result = S_OK;
+        switch (outcome)
+        {
+        case native::windows::detail::GuestStopPreparationResult::Prepared:
+            break;
+        case native::windows::detail::GuestStopPreparationResult::Rejected:
+            result = E_FAIL; // Child logged the exact HdvUnregisterDoorbell HRESULT.
+            break;
+        case native::windows::detail::GuestStopPreparationResult::RequestFailed:
+            result = HRESULT_FROM_WIN32(requestError);
+            break;
+        case native::windows::detail::GuestStopPreparationResult::TimedOut:
+            result = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            break;
+        case native::windows::detail::GuestStopPreparationResult::ChildExited:
+            result = HRESULT_FROM_WIN32(ERROR_PROCESS_ABORTED);
+            break;
+        case native::windows::detail::GuestStopPreparationResult::WaitFailed:
+            result = HRESULT_FROM_WIN32(waitError);
+            break;
+        case native::windows::detail::GuestStopPreparationResult::AlreadyRequested:
+            result = HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+            break;
+        }
+        native::windows::detail::TraceAudioSource(
+            L"HdvGuestStopPrepareParent", static_cast<std::uint32_t>(outcome), static_cast<std::uint32_t>(result));
+        return result;
+    }
+
     ~HdvHostProcess()
     {
         if (!m_guestStoppedConfirmed.load(std::memory_order_acquire))
         {
             // Emergency abort: there is no proof that the guest stopped, so do
             // not ask the child to claim retirement. The callback root remains
-            // process-pinned until job closure terminates the child.
+            // process-pinned until job closure terminates the child. A stop-
+            // preparation timeout uses this same owned-job abort while shutdown
+            // is still pending; neither path guarantees clean unregister.
             m_job.reset();
             return;
         }
@@ -360,9 +608,45 @@ public:
     }
 
 private:
+    void AbortUnacknowledgedGuestStopPreparation(native::windows::detail::GuestStopPreparationResult reason) noexcept
+    {
+        // Drop a request that may still be queued, then close only this
+        // HdvHostProcess's kill-on-close job. Do not signal the child's normal
+        // stop event: the guest has not been confirmed stopped, so it must not
+        // claim clean retirement or a successful doorbell unregister.
+        DWORD requestResetError = ERROR_SUCCESS;
+        if (m_prepareRequest && !ResetEvent(m_prepareRequest.get()))
+        {
+            requestResetError = GetLastError();
+        }
+        m_job.reset();
+
+        DWORD waitResult = WAIT_FAILED;
+        DWORD waitError = ERROR_INVALID_HANDLE;
+        DWORD childExitCode = STILL_ACTIVE;
+        if (m_child)
+        {
+            waitResult = WaitForSingleObject(m_child.get(), native::windows::detail::GuestStopPreparation::c_abortChildWaitMilliseconds);
+            waitError = waitResult == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+            if (waitResult == WAIT_OBJECT_0 && !GetExitCodeProcess(m_child.get(), &childExitCode))
+            {
+                waitError = GetLastError();
+            }
+        }
+
+        native::windows::detail::TraceAudioSource(
+            L"HdvGuestStopPrepareEmergencyAbort", static_cast<std::uint32_t>(reason), static_cast<std::uint32_t>(waitResult));
+        native::windows::detail::TraceAudioSource(L"HdvGuestStopPrepareEmergencyAbortDetails", requestResetError, waitError);
+        native::windows::detail::TraceAudioSource(L"HdvGuestStopPrepareEmergencyAbortExitCode", childExitCode);
+    }
+
     wil::unique_handle m_job;
     wil::unique_handle m_stop;
+    wil::unique_handle m_prepareRequest;
+    wil::unique_handle m_prepareSucceeded;
+    wil::unique_handle m_prepareFailed;
     wil::unique_handle m_child;
+    std::atomic_bool m_prepareAttempted{};
     std::atomic_bool m_guestStoppedConfirmed{};
 };
 } // namespace wsl::virtio_sound::process_host

@@ -321,6 +321,11 @@ jobs:
             mkdir $(ob_outputDirectory)\testbin\x64\release
 
             Copy-Item -Path "bin\x64\release\wsltests.dll" -Destination "$(ob_outputDirectory)\testbin\x64\release\wsltests.dll"
+            if ('${{ parameters.enableExperimentalVirtioSound }}' -eq 'True') {
+                # VirtioSoundUnitTests invokes the isolated regression suites
+                # from the directory containing wsltests.dll.
+                Copy-Item -Path "bin\x64\release\wsl_virtio_sound*_tests.exe" -Destination "$(ob_outputDirectory)\testbin\x64\release"
+            }
             Copy-Item -Path "bin\x64\release\testplugin.dll" -Destination "$(ob_outputDirectory)\testbin\x64\release\testplugin.dll"
             Copy-Item -Path "bin\x64\release\wslcsdk.dll" -Destination "$(ob_outputDirectory)\testbin\x64\release\wslcsdk.dll"
             Copy-Item -Path "bin\x64\release\installer.msix" -Destination "$(ob_outputDirectory)\testbin\x64\release\installer.msix"

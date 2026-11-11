@@ -12,14 +12,22 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "AudioSourceTrace.hpp"
 #include "HdvPciDeviceHost.hpp"
+#include "RxDoorbellLifecycle.hpp"
 
 namespace wsl::virtio_sound::native::windows {
+static_assert(detail::RxDoorbellSpecification::c_barIndex == HDV_PCI_BAR0);
+static_assert(detail::RxDoorbellSpecification::c_barOffset == 0x30c);
+static_assert(detail::RxDoorbellSpecification::c_triggerValue == 3);
+static_assert(detail::RxDoorbellSpecification::c_flags == HDV_DOORBELL_FLAG_TRIGGER_SIZE_WORD);
+static_assert((detail::RxDoorbellSpecification::c_flags & HDV_DOORBELL_FLAG_TRIGGER_ANY_VALUE) == 0);
 #if defined(WSL_VIRTIO_SOUND_ADAPTER_TESTING)
 namespace testing {
     struct GuestMemoryApertureBatchStats final
@@ -49,13 +57,19 @@ namespace {
         decltype(&::HdvDeliverGuestInterrupt) m_deliverGuestInterrupt{};
         decltype(&::HdvCreateGuestMemoryAperture) m_createGuestMemoryAperture{};
         decltype(&::HdvDestroyGuestMemoryAperture) m_destroyGuestMemoryAperture{};
+        decltype(&::HdvRegisterDoorbell) m_registerDoorbell{};
+        decltype(&::HdvUnregisterDoorbell) m_unregisterDoorbell{};
     };
+    static_assert(
+        std::is_same_v<decltype(&::HdvRegisterDoorbell), HRESULT(WINAPI*)(HDV_DEVICE, HDV_PCI_BAR_SELECTOR, UINT64, UINT64, UINT64, HANDLE)>);
+    static_assert(std::is_same_v<decltype(&::HdvUnregisterDoorbell), HRESULT(WINAPI*)(HDV_DEVICE, HDV_PCI_BAR_SELECTOR, UINT64, UINT64, UINT64)>);
 
 #if defined(WSL_VIRTIO_SOUND_ADAPTER_TESTING)
     using AperturePumpTestHook = void (*)(void* backendContext, void* hookContext) noexcept;
     using ApertureCopyTestHook = void (*)(void* hookContext, bool write) noexcept;
     using ApertureBatchEndTestHook = void (*)(void* hookContext) noexcept;
     using GuestMemoryCallbackTestInvoker = bool (*)(void* backendContext, bool write, UINT64 address, BYTE* buffer, UINT32 byteCount) noexcept;
+    std::atomic<bool> g_failNextHostWrapperAllocationForTesting{};
 
     struct HdvApiTestState
     {
@@ -285,7 +299,9 @@ namespace {
                 Resolve<decltype(&::HdvWriteGuestMemory)>(module.get(), "HdvWriteGuestMemory"),
                 Resolve<decltype(&::HdvDeliverGuestInterrupt)>(module.get(), "HdvDeliverGuestInterrupt"),
                 ResolveOptional<decltype(&::HdvCreateGuestMemoryAperture)>(module.get(), "HdvCreateGuestMemoryAperture"),
-                ResolveOptional<decltype(&::HdvDestroyGuestMemoryAperture)>(module.get(), "HdvDestroyGuestMemoryAperture")};
+                ResolveOptional<decltype(&::HdvDestroyGuestMemoryAperture)>(module.get(), "HdvDestroyGuestMemoryAperture"),
+                ResolveOptional<decltype(&::HdvRegisterDoorbell)>(module.get(), "HdvRegisterDoorbell"),
+                ResolveOptional<decltype(&::HdvUnregisterDoorbell)>(module.get(), "HdvUnregisterDoorbell")};
             (void)module.release();
             return result;
         }();
@@ -316,6 +332,19 @@ namespace testing {
         auto lock = state.m_hookLock.lock_exclusive();
         state.m_api.m_createGuestMemoryAperture = createAperture;
         state.m_api.m_destroyGuestMemoryAperture = destroyAperture;
+    }
+
+    void InstallDoorbellApiForTesting(decltype(&::HdvRegisterDoorbell) registerDoorbell, decltype(&::HdvUnregisterDoorbell) unregisterDoorbell)
+    {
+        auto& state = ApiTestState();
+        auto lock = state.m_hookLock.lock_exclusive();
+        state.m_api.m_registerDoorbell = registerDoorbell;
+        state.m_api.m_unregisterDoorbell = unregisterDoorbell;
+    }
+
+    void FailNextHostWrapperAllocationForTesting() noexcept
+    {
+        g_failNextHostWrapperAllocationForTesting.store(true, std::memory_order_release);
     }
 
     void SetAperturePumpTestHook(AperturePumpTestHook hook, void* context)
@@ -427,12 +456,14 @@ public:
         CopyFault
     };
 
-    BackendState(HCS_SYSTEM system, const GUID& classId, const GUID& instanceId, std::shared_ptr<PcmSource> source, HostOwnership hostOwnership) :
+    BackendState(HCS_SYSTEM system, const GUID& classId, const GUID& instanceId, std::shared_ptr<PcmSource> source, HostOwnership hostOwnership,
+        std::shared_ptr<CaptureWakeSignal> wake) :
         m_borrowedSystem(system),
         m_deviceClassId(classId),
         m_deviceInstanceId(instanceId),
         m_ownership(hostOwnership),
-        m_pcmSource(std::move(source))
+        m_pcmSource(std::move(source)),
+        m_wake(std::move(wake))
     {
         m_guestMemoryApertures.reserve(c_maxApertureEntries);
         m_retainedGuestMemoryApertures.reserve(c_maxApertureEntries);
@@ -500,12 +531,17 @@ public:
     GUID m_deviceInstanceId{};
     HostOwnership m_ownership{HostOwnership::UnknownOrShared};
     std::shared_ptr<PcmSource> m_pcmSource;
+    std::shared_ptr<CaptureWakeSignal> m_wake;
+    detail::RxDoorbellLifecycle m_rxDoorbell;
     std::unique_ptr<VirtioSoundDevice> m_device;
     HDV_PCI_DEVICE_INTERFACE m_interface{};
     HDV_HOST m_deviceHost{};
     HDV_DEVICE m_deviceHandle{};
     std::atomic<HRESULT> m_creationResult{E_PENDING};
     std::atomic<HRESULT> m_lastHostError{S_OK};
+    // Kept separate from the core notification counter: these exact RX kicks
+    // are deliberately handled by the adapter without entering the device gate.
+    std::atomic<std::uint64_t> m_rxCallbackFastPathRequests{};
     mutable std::mutex m_lifecycleMutex;
     std::condition_variable m_lifecycleChanged;
     _Guarded_by_(m_lifecycleMutex) std::uint32_t m_activeOperations {};
@@ -856,6 +892,95 @@ public:
         return m_deviceHandle;
     }
 
+    bool RegisterRxDoorbell(const HdvApi& api) noexcept
+    {
+        HRESULT result = E_NOTIMPL;
+        const HDV_DEVICE device = GetDeviceHandle();
+        const HANDLE event = m_wake ? m_wake->Event() : nullptr;
+        const bool registered = m_rxDoorbell.TryRegister(
+            api.m_registerDoorbell != nullptr && api.m_unregisterDoorbell != nullptr,
+            device != nullptr && event != nullptr,
+            [&](const detail::RxDoorbellSpecification& spec) {
+                result = api.m_registerDoorbell(
+                    device,
+                    static_cast<HDV_PCI_BAR_SELECTOR>(spec.c_barIndex),
+                    spec.c_barOffset,
+                    spec.c_triggerValue,
+                    spec.c_flags,
+                    event);
+                return SUCCEEDED(result);
+            });
+        detail::TraceAudioSource(L"HdvRxDoorbell", registered ? 1 : 0, static_cast<std::uint32_t>(result));
+        return registered;
+    }
+
+    bool UnregisterRxDoorbell() noexcept
+    {
+        if (!m_rxDoorbell.Active())
+        {
+            return !m_rxDoorbell.MustRetainEvent();
+        }
+
+        HRESULT result = E_FAIL;
+        const bool unregistered = m_rxDoorbell.TryUnregister([&](const detail::RxDoorbellSpecification& spec) {
+            try
+            {
+                const HdvApi& api = LoadApi();
+                const HDV_DEVICE device = GetDeviceHandle();
+                if (api.m_registerDoorbell == nullptr || api.m_unregisterDoorbell == nullptr || device == nullptr)
+                {
+                    result = E_HANDLE;
+                    return false;
+                }
+                result = api.m_unregisterDoorbell(
+                    device,
+                    static_cast<HDV_PCI_BAR_SELECTOR>(spec.c_barIndex),
+                    spec.c_barOffset,
+                    spec.c_triggerValue,
+                    spec.c_flags);
+                return SUCCEEDED(result);
+            }
+            catch (...)
+            {
+                result = E_FAIL;
+                return false;
+            }
+        });
+        detail::TraceAudioSource(L"HdvRxDoorbellUnregister", unregistered ? 1 : 0, static_cast<std::uint32_t>(result));
+        return unregistered;
+    }
+
+    HRESULT PrepareRxDoorbellForGuestStop() noexcept
+    {
+        HRESULT result = S_OK;
+        const bool prepared = m_rxDoorbell.PrepareForGuestStop([&](const detail::RxDoorbellSpecification& spec) {
+            try
+            {
+                const HdvApi& api = LoadApi();
+                const HDV_DEVICE device = GetDeviceHandle();
+                if (api.m_registerDoorbell == nullptr || api.m_unregisterDoorbell == nullptr || device == nullptr)
+                {
+                    result = E_HANDLE;
+                    return false;
+                }
+                result = api.m_unregisterDoorbell(
+                    device, static_cast<HDV_PCI_BAR_SELECTOR>(spec.c_barIndex), spec.c_barOffset, spec.c_triggerValue, spec.c_flags);
+                return SUCCEEDED(result);
+            }
+            catch (...)
+            {
+                result = E_FAIL;
+                return false;
+            }
+        });
+        if (!prepared && SUCCEEDED(result))
+        {
+            result = E_FAIL;
+        }
+        detail::TraceAudioSource(L"HdvRxDoorbellPrepareStop", prepared ? 1 : 0, static_cast<std::uint32_t>(result));
+        return prepared ? S_OK : result;
+    }
+
     static bool ReadGuestMemory(void* context, std::uint64_t address, std::uint8_t* destination, std::size_t byteCount) noexcept
     {
         auto* state = static_cast<BackendState*>(context);
@@ -1049,6 +1174,10 @@ public:
             }
             state.m_started = true;
             state.m_lastHostError.store(S_OK, std::memory_order_relaxed);
+            if (state.m_wake)
+            {
+                state.m_wake->Notify(CaptureWakeReason::GuestState);
+            }
             return S_OK;
         });
     }
@@ -1075,6 +1204,10 @@ public:
     {
         return Guard(context, [offset, value](BackendState& state) {
             state.m_device->WriteConfig(offset, value, 4);
+            if (state.m_wake)
+            {
+                state.m_wake->Notify(CaptureWakeReason::GuestState);
+            }
             return S_OK;
         });
     }
@@ -1098,7 +1231,22 @@ public:
             return E_INVALIDARG;
         }
         return Guard(context, [offset, length, value](BackendState& state) {
+            // A valid RX queue kick is a rescan request only. RX queue work is
+            // paced by ServiceCapture, so avoid taking VirtioSoundDevice's
+            // gate here; ServiceCapture can hold it while doing guest-memory
+            // and interrupt work. Keep this branch exact so malformed writes
+            // retain the core's validation and fault behavior.
+            if (offset == 0x30c && length == sizeof(std::uint16_t) && value[0] == 3 && value[1] == 0 && state.m_wake)
+            {
+                state.m_rxCallbackFastPathRequests.fetch_add(1, std::memory_order_relaxed);
+                state.m_wake->Notify(CaptureWakeReason::GuestQueue);
+                return S_OK;
+            }
             state.m_device->WriteBar(offset, value, static_cast<std::size_t>(length));
+            if (state.m_wake)
+            {
+                state.m_wake->Notify(offset == 0x30c ? CaptureWakeReason::GuestQueue : CaptureWakeReason::GuestState);
+            }
             return S_OK;
         });
     }
@@ -1116,6 +1264,10 @@ public:
             state->m_device->Reset();
             std::lock_guard<std::mutex> lock(state->m_lifecycleMutex);
             state->m_started = false;
+            if (state->m_wake)
+            {
+                state->m_wake->Notify(CaptureWakeReason::GuestState);
+            }
         }
         catch (...)
         {
@@ -1131,7 +1283,8 @@ HdvPciDeviceHost::HdvPciDeviceHost(std::shared_ptr<BackendState> state) noexcept
 HdvPciDeviceHost::~HdvPciDeviceHost() = default;
 
 std::unique_ptr<HdvPciDeviceHost> HdvPciDeviceHost::CreateBorrowed(
-    HCS_SYSTEM borrowedSystem, const GUID& deviceClassId, const GUID& deviceInstanceId, std::shared_ptr<PcmSource> source, HostOwnership ownership)
+    HCS_SYSTEM borrowedSystem, const GUID& deviceClassId, const GUID& deviceInstanceId, std::shared_ptr<PcmSource> source,
+    HostOwnership ownership, std::shared_ptr<CaptureWakeSignal> wake)
 {
     if (borrowedSystem == nullptr)
     {
@@ -1143,7 +1296,7 @@ std::unique_ptr<HdvPciDeviceHost> HdvPciDeviceHost::CreateBorrowed(
     }
 
     const HdvApi& api = LoadApi();
-    auto state = std::make_shared<BackendState>(borrowedSystem, deviceClassId, deviceInstanceId, std::move(source), ownership);
+    auto state = std::make_shared<BackendState>(borrowedSystem, deviceClassId, deviceInstanceId, std::move(source), ownership, std::move(wake));
     HRESULT hr = api.m_initialize(borrowedSystem, &state->m_deviceHost);
     state->m_creationResult.store(hr, std::memory_order_relaxed);
     if (hr < 0)
@@ -1196,11 +1349,21 @@ std::unique_ptr<HdvPciDeviceHost> HdvPciDeviceHost::CreateBorrowed(
     {
         // Copy the shared owner until allocation succeeds so the failure path
         // can still fail-close the process-pinned callback context.
+#if defined(WSL_VIRTIO_SOUND_ADAPTER_TESTING)
+        if (g_failNextHostWrapperAllocationForTesting.exchange(false, std::memory_order_acq_rel))
+        {
+            throw std::bad_alloc();
+        }
+#endif
         return std::unique_ptr<HdvPciDeviceHost>(new HdvPciDeviceHost(state));
     }
     catch (...)
     {
         state->FailClosedAfterRegistration();
+        // Registration can hold the event independently of the C++ wrapper.
+        // The callback root was pinned before device creation, so an uncertain
+        // unregister keeps the event alive until process exit.
+        (void)state->UnregisterRxDoorbell();
         throw;
     }
 }
@@ -1227,11 +1390,42 @@ RetireOutcome HdvPciDeviceHost::GuestStoppedAndRetire() noexcept
     state.m_retireOutcome = state.m_ownership == HostOwnership::VerifiedExclusive ? RetireOutcome::TeardownFailedAndPinned
                                                                                   : RetireOutcome::OwnershipUnprovenAndPinned;
     lock.unlock();
+    const bool rxDoorbellUnregistered = state.m_rxDoorbell.CompleteAfterGuestStop();
     const bool aperturesCleaned = state.FlushGuestMemoryAperturesForRetirement();
     TraceApertureSummary();
+    // Aggregate metadata only, emitted after callbacks and pumps are drained.
+    // Diagnostics must never change retirement or ownership decisions.
+    try
+    {
+        const auto capture = state.m_device->GetDiagnosticsSnapshot();
+        detail::TraceAudioSource(L"CapturePumpTotals", capture.m_capturePumpCalls, capture.m_capturePumpCompletedFrames);
+        detail::TraceAudioSource(L"CapturePumpEmpty", capture.m_capturePumpNoProgressCalls, capture.m_capturePumpRequestedFrames);
+        detail::TraceAudioSource(L"CaptureIntervals", capture.m_captureElapsedPumpCalls, capture.m_captureElapsedNanoseconds);
+        detail::TraceAudioSource(L"CaptureIntervalMax", capture.m_captureMaximumElapsedNanoseconds);
+        detail::TraceAudioSource(L"CaptureBacklogMax", capture.m_captureMaximumSourceAvailableFrames, capture.m_captureMaximumRxOutstandingAvailable);
+        detail::TraceAudioSource(L"CaptureScratch", capture.m_captureScratchCapacityGrowths, capture.m_captureScratchCapacityBytes);
+        detail::TraceAudioSource(L"CaptureBacklogZeroSubPeriod", capture.m_captureBacklogSamples[0], capture.m_captureBacklogSamples[1]);
+        detail::TraceAudioSource(L"CaptureBacklogOneTwoPeriods", capture.m_captureBacklogSamples[2], capture.m_captureBacklogSamples[3]);
+        detail::TraceAudioSource(L"CaptureBacklogFourEightPeriods", capture.m_captureBacklogSamples[4], capture.m_captureBacklogSamples[5]);
+        detail::TraceAudioSource(L"CaptureReleaseAndErrors", capture.m_captureReleaseCompletions, capture.m_captureErrorCompletions);
+        detail::TraceAudioSource(L"CaptureRxKickFastPathRequests", state.m_rxCallbackFastPathRequests.load(std::memory_order_relaxed));
+    }
+    catch (...)
+    {
+        // Continue retirement even if the diagnostic snapshot is unavailable.
+    }
     lock.lock();
     if (!aperturesCleaned)
     {
+        const RetireOutcome outcome = state.m_retireOutcome;
+        lock.unlock();
+        return outcome;
+    }
+    if (!rxDoorbellUnregistered)
+    {
+        // An uncertain unregister may leave HDV holding the event handle. Keep
+        // the callback root pinned and skip host teardown.
+        state.m_retireOutcome = RetireOutcome::TeardownFailedAndPinned;
         const RetireOutcome outcome = state.m_retireOutcome;
         lock.unlock();
         return outcome;
@@ -1277,6 +1471,20 @@ RetireOutcome HdvPciDeviceHost::GuestStoppedAndRetire() noexcept
     state.m_retireOutcome = RetireOutcome::TeardownFailedAndPinned;
     lock.unlock(); // no automatic retry against a partial host teardown
     return RetireOutcome::TeardownFailedAndPinned;
+}
+
+HRESULT HdvPciDeviceHost::PrepareForGuestStop() noexcept
+{
+    if (!m_state)
+    {
+        return E_ABORT;
+    }
+    BackendState::Operation operation(m_state.get());
+    if (!operation)
+    {
+        return E_ABORT;
+    }
+    return m_state->PrepareRxDoorbellForGuestStop();
 }
 
 int HdvPciDeviceHost::PumpCapture(int frameBudget) noexcept
@@ -1333,6 +1541,47 @@ int HdvPciDeviceHost::PumpCaptureElapsed(std::uint64_t elapsedNanoseconds) noexc
     }
 }
 
+CaptureServiceResult HdvPciDeviceHost::ServiceCapture(std::uint64_t elapsedNanoseconds, bool allowTransfer) noexcept
+{
+    CaptureServiceResult result;
+    if (!m_state)
+    {
+        return result;
+    }
+    BackendState::Operation operation(m_state.get(), true);
+    if (!operation)
+    {
+        return result;
+    }
+    try
+    {
+        // The exact RX callback proves that the guest has assigned and used
+        // this BAR address. Register from the host servicing thread, outside
+        // both the HDV callback and the device gate, while this started
+        // Operation pins BackendState against retirement.
+        if (m_state->m_rxDoorbell.State() == detail::RxDoorbellState::Unattempted &&
+            m_state->m_rxCallbackFastPathRequests.load(std::memory_order_relaxed) != 0)
+        {
+            (void)m_state->RegisterRxDoorbell(LoadApi());
+        }
+        BackendState::ApertureBatch apertureBatch(*m_state);
+#if defined(WSL_VIRTIO_SOUND_ADAPTER_TESTING)
+        NotifyAperturePumpTestHook(m_state.get());
+#endif
+        result = m_state->m_device->ServiceCapture(elapsedNanoseconds, allowTransfer);
+        if (!apertureBatch.Finish())
+        {
+            result.m_waitReason = CaptureWaitReason::Failed;
+        }
+    }
+    catch (...)
+    {
+        m_state->m_lastHostError.store(E_FAIL, std::memory_order_relaxed);
+        result.m_waitReason = CaptureWaitReason::Failed;
+    }
+    return result;
+}
+
 bool HdvPciDeviceHost::CaptureRunning() const noexcept
 {
     return m_state && m_state->m_device->CaptureRunning();
@@ -1351,6 +1600,11 @@ std::uint32_t HdvPciDeviceHost::MaximumCaptureFrameBudget() const noexcept
 std::uint64_t HdvPciDeviceHost::CapturePacingGeneration() const noexcept
 {
     return m_state ? m_state->m_device->CapturePacingGeneration() : 0;
+}
+
+bool HdvPciDeviceHost::RxDoorbellRegistered() const noexcept
+{
+    return m_state && m_state->m_rxDoorbell.Active();
 }
 
 HostOwnership HdvPciDeviceHost::Ownership() const noexcept
